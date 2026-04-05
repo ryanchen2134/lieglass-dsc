@@ -26,7 +26,7 @@ from .config import ModelConfig
 from .data.dataset import DeceptionDataset
 from .data.collate import collate_fn
 from .data.sampler import make_weighted_sampler
-from .models.full_model import MultimodalDeceptionModel
+from .models.fusion_model import FusionModel
 
 
 def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device, grad_clip):
@@ -168,7 +168,7 @@ def run_cross_validation(config: ModelConfig):
         )
 
         # Model, optimizer, scheduler
-        model = MultimodalDeceptionModel(config).to(device)
+        model = FusionModel(config).to(device)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = AdamW(trainable_params, lr=config.learning_rate, weight_decay=config.weight_decay)
         total_steps = config.max_epochs * len(train_loader)

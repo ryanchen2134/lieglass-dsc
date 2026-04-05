@@ -16,7 +16,7 @@ from pathlib import Path
 from .config import ModelConfig
 from .data.dataset import DeceptionDataset
 from .data.collate import collate_fn
-from .models.full_model import MultimodalDeceptionModel
+from .models.fusion_model import FusionModel
 from .train import evaluate as _evaluate
 
 
@@ -49,7 +49,7 @@ def main():
         pin_memory=True,
     )
 
-    model = MultimodalDeceptionModel(config).to(device)
+    model = FusionModel(config).to(device)
     state = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(state)
     print(f"Loaded checkpoint: {args.checkpoint}")
