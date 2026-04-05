@@ -1,25 +1,68 @@
 import csv
+import numpy as np
 import torch
+import torchaudio
 from torch.utils.data import Dataset
 from pathlib import Path
 
 
+def _sample_frames(video_path: Path, n: int = 64) -> torch.Tensor:
+    """
+    Uniformly sample `n` frames from a video file and return as a FloatTensor.
+
+    Returns:
+        FloatTensor (n, 3, 224, 224) — ImageNet-normalised RGB frames
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if total <= 0:
+        cap.release()
+        return torch.zeros(n, 3, 224, 224)
+
+    indices = np.linspace(0, total - 1, n, dtype=int)
+
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, frame = cap.read()
+        if not ret:
+            frames.append(np.zeros((224, 224, 3), dtype=np.float32))
+            continue
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (224, 224))
+        frame = frame.astype(np.float32) / 255.0
+        frame = (frame - mean) / std
+        frames.append(frame)
+
+    cap.release()
+
+    arr = np.stack(frames)               # (n, 224, 224, 3)
+    arr = arr.transpose(0, 3, 1, 2)     # (n, 3, 224, 224)
+    return torch.from_numpy(arr)
+
+
 class DeceptionDataset(Dataset):
     """
-    Loads pre-extracted features from disk.
-    Each __getitem__ returns a dict with all modalities + metadata.
+    Loads audio.wav and video.mp4 from pre-processed feature directories.
+    Each __getitem__ returns a dict with waveform, frames, label, and sample_id.
     """
 
     def __init__(self, manifest_csv: str, feature_dir: str, augment: bool = False):
         """
         Args:
-            manifest_csv: Path to CSV with columns [sample_id, label, dataset_source, ...].
-            feature_dir:  Root directory containing per-sample feature folders.
+            manifest_csv: CSV with columns [sample_id, label, dataset_source, ...].
+            feature_dir:  Root dir containing per-sample feature folders.
             augment:      Whether to apply data augmentation (training only).
         """
         self.feature_dir = Path(feature_dir)
         self.augment = augment
-        self.samples = []  # list of (sample_id, label)
+        self.samples = []
 
         with open(manifest_csv, newline="") as f:
             reader = csv.DictReader(f)
@@ -37,57 +80,32 @@ class DeceptionDataset(Dataset):
         sample_id, label = self.samples[idx]
         feat_path = self.feature_dir / sample_id
 
-        text_data = torch.load(feat_path / "text.pt", weights_only=True)
-        mfcc_data = torch.load(feat_path / "mfcc.pt", weights_only=True)
-        land_data = torch.load(feat_path / "landmarks.pt", weights_only=True)
+        # --- Audio: raw 16 kHz waveform ---
+        waveform, sr = torchaudio.load(feat_path / "audio.wav")
+        if sr != 16000:
+            waveform = torchaudio.functional.resample(waveform, sr, 16000)
+        waveform = waveform.squeeze(0)  # (T,)
+
+        # --- Visual: 64 uniformly sampled face frames ---
+        frames = _sample_frames(feat_path / "video.mp4", n=64)  # (64, 3, 224, 224)
 
         if self.augment:
-            mfcc_data = self._augment_mfcc(mfcc_data)
-            land_data = self._augment_landmarks(land_data)
+            waveform = self._augment_waveform(waveform)
+            frames   = self._augment_frames(frames)
 
         return {
-            "text_token_ids": text_data["token_ids"],           # LongTensor (n,)
-            "text_timestamps": text_data["timestamps"],         # FloatTensor (n, 2)
-            "mfcc": mfcc_data["mfcc"],                          # FloatTensor (T_m, 13, 3)
-            "mfcc_timestamps": mfcc_data["timestamps"],         # FloatTensor (T_m,)
-            "landmarks": land_data["landmarks"],                # FloatTensor (T_l, 136, 3)
-            "landmark_timestamps": land_data["timestamps"],     # FloatTensor (T_l,)
-            "frame_mask": land_data["frame_mask"],              # BoolTensor (T_l,)
-            "label": torch.tensor(label, dtype=torch.float32), # scalar
+            "waveform":  waveform,                                    # FloatTensor (T,)
+            "frames":    frames,                                      # FloatTensor (64, 3, 224, 224)
+            "label":     torch.tensor(label, dtype=torch.float32),   # scalar
             "sample_id": sample_id,
         }
 
-    def _augment_mfcc(self, mfcc_data: dict) -> dict:
-        """
-        Augmentations for MFCC:
-        1. Additive Gaussian noise: sigma ~ U(0, 0.01)
-        2. Temporal dropout: randomly zero ~5-10% of frames
-        """
-        mfcc = mfcc_data["mfcc"].clone()  # (T_m, 13, 3)
-        T = mfcc.shape[0]
+    def _augment_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Light additive noise augmentation for audio."""
+        sigma = torch.empty(1).uniform_(0.0, 0.005).item()
+        return waveform + torch.randn_like(waveform) * sigma
 
-        # Additive noise
-        sigma = torch.empty(1).uniform_(0, 0.01).item()
-        mfcc = mfcc + torch.randn_like(mfcc) * sigma
-
-        # Temporal dropout: zero out ~5-10% of frames
-        drop_rate = torch.empty(1).uniform_(0.05, 0.10).item()
-        drop_mask = torch.rand(T) < drop_rate
-        mfcc[drop_mask] = 0.0
-
-        return {**mfcc_data, "mfcc": mfcc}
-
-    def _augment_landmarks(self, land_data: dict) -> dict:
-        """
-        Augmentations for landmarks:
-        1. Additive Gaussian jitter on valid frames only: sigma ~ U(0, 0.005)
-        """
-        landmarks = land_data["landmarks"].clone()  # (T_l, 136, 3)
-        frame_mask = land_data["frame_mask"]        # (T_l,) bool
-
-        sigma = torch.empty(1).uniform_(0, 0.005).item()
-        noise = torch.randn_like(landmarks) * sigma
-        noise[~frame_mask] = 0.0  # only jitter valid frames
-        landmarks = landmarks + noise
-
-        return {**land_data, "landmarks": landmarks}
+    def _augment_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        """Light pixel-noise augmentation for frames (after normalisation)."""
+        sigma = torch.empty(1).uniform_(0.0, 0.02).item()
+        return frames + torch.randn_like(frames) * sigma
