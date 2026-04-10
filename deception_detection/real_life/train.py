@@ -144,8 +144,8 @@ def run_cross_validation(config: RealLifeConfig):
             batch_size=config.batch_size,
             sampler=train_sampler,
             collate_fn=collate_fn,
-            num_workers=2,
-            pin_memory=True,
+            num_workers=0,
+            pin_memory=False,
             drop_last=True,
         )
         val_loader = DataLoader(
@@ -153,8 +153,8 @@ def run_cross_validation(config: RealLifeConfig):
             batch_size=config.batch_size,
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=2,
-            pin_memory=True,
+            num_workers=0,
+            pin_memory=False,
         )
 
         model = BimodalDeceptionModel(config).to(device)
