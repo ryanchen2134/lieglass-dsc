@@ -1,67 +1,51 @@
+"""
+SimpleClassificationHead — replaces the previous BiDirTransformerClassifier.
+
+The old classifier had ~15M trainable parameters (2-layer BiDir transformer,
+d_model=896, 4 heads, ff=3584) which massively overfit on ~1150 samples.
+
+This replacement is a 2-layer MLP with ~10K parameters:
+    Linear(d_in, 64) → GELU → Dropout(0.5) → Linear(64, 2)
+
+Output is 2-class logits for CrossEntropyLoss (not sigmoid/BCE).
+"""
+
 import torch
 import torch.nn as nn
 
 
-class BiDirTransformerClassifier(nn.Module):
+class SimpleClassificationHead(nn.Module):
     """
-    Bidirectional transformer encoder with [CLS] token pooling and a dense head.
+    Lightweight 2-layer MLP classifier.
 
-    Input:  fused multimodal sequence (B, n, d_fused)
-    Output: logits (B,) — raw logit, apply sigmoid + BCE loss externally.
+    Args:
+        d_in:      Input dimension (n_fusion_layers * d_fusion_out + d_text_proj).
+                   Default: 4*64 + 256 = 512.
+        d_hidden:  Hidden dimension (default 64).
+        dropout:   Dropout probability (default 0.5).
+        n_classes: Number of output classes (default 2).
     """
 
     def __init__(
         self,
-        d_fused: int,
-        n_layers: int,
-        n_heads: int,
-        ff_mult: int = 4,
-        dropout: float = 0.3,
+        d_in: int = 512,
+        d_hidden: int = 64,
+        dropout: float = 0.5,
+        n_classes: int = 2,
     ):
         super().__init__()
-
-        # Learnable [CLS] token — initialized at unit scale to match concatenated sequence tokens
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_fused))
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_fused,
-            nhead=n_heads,
-            dim_feedforward=d_fused * ff_mult,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,   # Pre-LN for stability
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
         self.head = nn.Sequential(
-            nn.LayerNorm(d_fused),
-            nn.Linear(d_fused, 256),
+            nn.Linear(d_in, d_hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 1),
+            nn.Linear(d_hidden, n_classes),
         )
 
-    def forward(self, fused: torch.Tensor, padding_mask=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            fused:        (B, n, d_fused)
-            padding_mask: (B, n) BoolTensor, True = PAD (optional)
+            x: (B, d_in)
         Returns:
-            logits: (B,)
+            logits: (B, n_classes)  — raw scores for CrossEntropyLoss.
         """
-        B = fused.shape[0]
-
-        cls = self.cls_token.expand(B, -1, -1)           # (B, 1, d_fused)
-        x = torch.cat([cls, fused], dim=1)               # (B, n+1, d_fused)
-
-        if padding_mask is not None:
-            cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=fused.device)
-            full_mask = torch.cat([cls_mask, padding_mask], dim=1)  # (B, n+1)
-        else:
-            full_mask = None
-
-        x = self.transformer(x, src_key_padding_mask=full_mask)
-
-        cls_out = x[:, 0, :]                             # (B, d_fused)
-        return self.head(cls_out).squeeze(-1)            # (B,)
+        return self.head(x)

@@ -54,9 +54,9 @@ def main():
     model.load_state_dict(state)
     print(f"Loaded checkpoint: {args.checkpoint}")
 
-    # pos_weight = 1 for evaluation (not used in metric calculation, only loss)
-    pos_weight = torch.tensor([1.0])
-    metrics = _evaluate(model, loader, pos_weight, device)
+    import torch.nn as nn
+    loss_fn = nn.CrossEntropyLoss()
+    metrics = _evaluate(model, loader, loss_fn, device)
 
     print("\nEvaluation Results:")
     for k, v in metrics.items():
