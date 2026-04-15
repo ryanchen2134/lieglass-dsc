@@ -7,9 +7,10 @@ def collate_fn(batch):
     Collate a list of dataset items into a padded batch.
 
     Returns dict with keys:
-        waveform        FloatTensor (B, T_max)        — zero-padded waveforms
-        waveform_mask   BoolTensor  (B, T_max)        — True = valid sample
+        waveform        FloatTensor (B, T_max)           — zero-padded waveforms
+        waveform_mask   BoolTensor  (B, T_max)           — True = valid sample
         frames          FloatTensor (B, 64, 3, 224, 224)
+        frame_mask      BoolTensor  (B, 64)              — True = speaker visible
         label           FloatTensor (B,)
         sample_ids      list of str
     """
@@ -24,7 +25,8 @@ def collate_fn(batch):
         wave_mask[i, :w.shape[0]] = True  # True = valid
 
     # --- Frames (fixed 64 frames per sample) ---
-    frames = torch.stack([item["frames"] for item in batch])  # (B, 64, 3, 224, 224)
+    frames     = torch.stack([item["frames"]     for item in batch])  # (B, 64, 3, 224, 224)
+    frame_mask = torch.stack([item["frame_mask"] for item in batch])  # (B, 64) bool
 
     # --- Labels & IDs ---
     labels     = torch.stack([item["label"] for item in batch])   # (B,)
@@ -34,6 +36,7 @@ def collate_fn(batch):
         "waveform":      wave_padded,
         "waveform_mask": wave_mask,
         "frames":        frames,
+        "frame_mask":    frame_mask,
         "label":         labels,
         "sample_ids":    sample_ids,
     }

@@ -6,12 +6,20 @@ from torch.utils.data import Dataset
 from pathlib import Path
 
 
-def _sample_frames(video_path: Path, n: int = 64) -> torch.Tensor:
+def _sample_frames(
+    video_path: Path,
+    mask_path: Path | None,
+    n: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Uniformly sample `n` frames from a video file and return as a FloatTensor.
+    Uniformly sample `n` frames from a video file.
 
     Returns:
-        FloatTensor (n, 3, 224, 224) — ImageNet-normalised RGB frames
+        frames     FloatTensor (n, 3, 224, 224) — ImageNet-normalised RGB frames
+        frame_mask BoolTensor  (n,)             — True = speaker visible (not black frame)
+
+    frame_mask is derived from frame_mask.npy if available; otherwise all-True
+    (assume every frame is valid).
     """
     import cv2
 
@@ -20,9 +28,18 @@ def _sample_frames(video_path: Path, n: int = 64) -> torch.Tensor:
 
     if total <= 0:
         cap.release()
-        return torch.zeros(n, 3, 224, 224)
+        return torch.zeros(n, 3, 224, 224), torch.ones(n, dtype=torch.bool)
 
     indices = np.linspace(0, total - 1, n, dtype=int)
+
+    # --- Frame mask sampled at same indices ---
+    if mask_path is not None and mask_path.exists():
+        full_mask = np.load(str(mask_path))          # (n_frames,) bool
+        # Clip in case mask length differs slightly from frame count
+        clipped = np.clip(indices, 0, len(full_mask) - 1)
+        sampled_mask = torch.from_numpy(full_mask[clipped].copy())
+    else:
+        sampled_mask = torch.ones(n, dtype=torch.bool)
 
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -44,7 +61,7 @@ def _sample_frames(video_path: Path, n: int = 64) -> torch.Tensor:
 
     arr = np.stack(frames)               # (n, 224, 224, 3)
     arr = arr.transpose(0, 3, 1, 2)     # (n, 3, 224, 224)
-    return torch.from_numpy(arr)
+    return torch.from_numpy(arr), sampled_mask
 
 
 class DeceptionDataset(Dataset):
@@ -86,18 +103,23 @@ class DeceptionDataset(Dataset):
             waveform = torchaudio.functional.resample(waveform, sr, 16000)
         waveform = waveform.squeeze(0)  # (T,)
 
-        # --- Visual: 64 uniformly sampled face frames ---
-        frames = _sample_frames(feat_path / "video.mp4", n=64)  # (64, 3, 224, 224)
+        # --- Visual: 64 uniformly sampled face frames + mask ---
+        frames, frame_mask = _sample_frames(
+            feat_path / "video.mp4",
+            feat_path / "frame_mask.npy",
+            n=64,
+        )  # (64, 3, 224, 224), (64,)
 
         if self.augment:
             waveform = self._augment_waveform(waveform)
             frames   = self._augment_frames(frames)
 
         return {
-            "waveform":  waveform,                                    # FloatTensor (T,)
-            "frames":    frames,                                      # FloatTensor (64, 3, 224, 224)
-            "label":     torch.tensor(label, dtype=torch.float32),   # scalar
-            "sample_id": sample_id,
+            "waveform":   waveform,                                    # FloatTensor (T,)
+            "frames":     frames,                                      # FloatTensor (64, 3, 224, 224)
+            "frame_mask": frame_mask,                                  # BoolTensor  (64,)
+            "label":      torch.tensor(label, dtype=torch.float32),   # scalar
+            "sample_id":  sample_id,
         }
 
     def _augment_waveform(self, waveform: torch.Tensor) -> torch.Tensor:

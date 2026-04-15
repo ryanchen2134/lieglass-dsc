@@ -90,13 +90,21 @@ class ViT_Model(nn.Module):
         # Explicitly delete the full ViT to free memory
         del vit
 
-    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        frames: torch.Tensor,
+        frame_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
-            frames: FloatTensor (B, n_frames, 3, 224, 224)
+            frames:     FloatTensor (B, n_frames, 3, 224, 224)
+            frame_mask: BoolTensor  (B, n_frames) — True = speaker visible (not black).
+                        When provided, only valid frames contribute to the output
+                        embedding (masked mean pooling).  If all frames in a sample
+                        are black the fallback is a uniform mean over all tokens.
 
         Returns:
-            FloatTensor (B, 768) — mean-pooled visual embedding
+            FloatTensor (B, 768) — (masked) mean-pooled visual embedding
         """
         B, T, C, H, W = frames.shape
 
@@ -112,5 +120,21 @@ class ViT_Model(nn.Module):
         for layer in self.vit_layers:
             x = layer(x)[0]               # ViTLayer returns (hidden_states, ...)
 
-        x = self.norm(x)
-        return x.mean(dim=1)              # (B, 768)
+        x = self.norm(x)                   # (B, T, 768)
+
+        # --- Masked mean pooling ---
+        # Black frames (frame_mask == False) are excluded from the average so they
+        # don't dilute the visual embedding with zero-input CNN activations.
+        if frame_mask is not None:
+            valid = frame_mask.to(x.dtype).unsqueeze(-1)   # (B, T, 1)
+            n_valid = valid.sum(dim=1)                     # (B, 1)
+            # Fall back to uniform mean for samples where every frame is black.
+            all_black = (n_valid == 0)                     # (B, 1)
+            n_valid = n_valid.clamp(min=1.0)
+            pooled = (x * valid).sum(dim=1) / n_valid      # (B, 768)
+            if all_black.any():
+                uniform = x.mean(dim=1)                    # (B, 768)
+                pooled = torch.where(all_black, uniform, pooled)
+            return pooled
+
+        return x.mean(dim=1)               # (B, 768)
