@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model checkpoints & large outputs
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Feature data (large, generated)
+features/
+
+# Logs & errors
+*.log
+preprocessing_errors.txt
+preprocess_resized_errors.txt
+
+# OS
+.DS_Store
+Thumbs.db
