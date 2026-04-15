@@ -34,19 +34,23 @@ def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device, gra
     total_loss = 0.0
     all_preds = []
     all_labels = []
-
-    for batch in loader:
+    print(f"    Training on {len(loader.dataset)} samples ({len(loader)} batches)...")
+    for i, batch in enumerate(loader):
+        print(f"    Batch {i+1}/{len(loader)}", end="\r")
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
+        print(" " * 50, end="\r")  # Clear line after batch processing
         logits = model(batch)  # (B,)
+        print(f"    Logits range: [{logits.min().item():.2f}, {logits.max().item():.2f}]")
         loss = F.binary_cross_entropy_with_logits(
             logits,
             batch["label"],
             pos_weight=pos_weight.to(device),
         )
+        print(f"    Batch raw loss: {loss.item():.4f}")
 
         optimizer.zero_grad()
         loss.backward()
+        print(f"    Batch loss: {loss.item():.4f}")
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
         scheduler.step()
@@ -187,6 +191,7 @@ def run_cross_validation(config: ModelConfig):
         patience_counter = 0
 
         for epoch in range(config.max_epochs):
+            print(f"  Epoch {epoch+1}/{config.max_epochs}")
             train_loss, train_acc = train_one_epoch(
                 model, train_loader, optimizer, scheduler,
                 pos_weight, device, config.grad_clip,
@@ -228,6 +233,15 @@ def run_cross_validation(config: ModelConfig):
 
 
 def main():
+    #cuda device:
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        print(f"Using CUDA device {device}: {torch.cuda.get_device_name(device)}")
+    else:
+        print("CUDA not available, using CPU")
+        device = "cpu"
+    
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", default=None)
     parser.add_argument("--feature_dir", default=None)
