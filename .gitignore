@@ -35,3 +35,5 @@ preprocess_resized_errors.txt
 # OS
 .DS_Store
 Thumbs.db
+
+*.pyc
