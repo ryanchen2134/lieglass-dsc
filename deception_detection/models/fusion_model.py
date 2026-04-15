@@ -85,8 +85,9 @@ class FusionModel(nn.Module):
         Args:
             batch: dict with keys:
                 waveform        FloatTensor (B, T)
-                waveform_mask   BoolTensor  (B, T)  True=valid  (optional)
+                waveform_mask   BoolTensor  (B, T)   True=valid  (optional)
                 frames          FloatTensor (B, n_frames, 3, 224, 224)
+                frame_mask      BoolTensor  (B, n_frames)  True=speaker visible (optional)
 
         Returns:
             logits FloatTensor (B,) — raw (pre-sigmoid) logits
@@ -94,9 +95,10 @@ class FusionModel(nn.Module):
         waveform = batch["waveform"]
         frames   = batch["frames"]
         waveform_mask = batch.get("waveform_mask")
+        frame_mask    = batch.get("frame_mask")      # (B, n_frames) bool or None
 
-        audio_emb  = self.audio_model(waveform, waveform_mask)  # (B, 768)
-        visual_emb = self.visual_model(frames)                   # (B, 768)
+        audio_emb  = self.audio_model(waveform, waveform_mask)   # (B, 768)
+        visual_emb = self.visual_model(frames, frame_mask)        # (B, 768)
 
         fused  = self.fusion(audio_emb, visual_emb)              # (B, 512)
         logits = self.head(fused).squeeze(-1)                    # (B,)
