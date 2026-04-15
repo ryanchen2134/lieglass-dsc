@@ -149,13 +149,15 @@ def run_cross_validation(config: ModelConfig):
 
         train_sampler = make_weighted_sampler(train_labels)
 
+        pin = device.type == "cuda"
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
             sampler=train_sampler,
             collate_fn=collate_fn,
-            num_workers=4,
-            pin_memory=True,
+            num_workers=config.num_workers,
+            pin_memory=pin,
+            persistent_workers=config.num_workers > 0,
             drop_last=True,
         )
         val_loader = DataLoader(
@@ -163,8 +165,9 @@ def run_cross_validation(config: ModelConfig):
             batch_size=config.batch_size,
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=4,
-            pin_memory=True,
+            num_workers=config.num_workers,
+            pin_memory=pin,
+            persistent_workers=config.num_workers > 0,
         )
 
         # Model, optimizer, scheduler
@@ -233,6 +236,9 @@ def main():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--folds", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=None,
+                        help="DataLoader workers (default 0; increase only if OpenCV "
+                             "multiprocessing works on your system)")
     args = parser.parse_args()
 
     config = ModelConfig()
@@ -250,6 +256,8 @@ def main():
         config.max_epochs = args.epochs
     if args.folds:
         config.n_folds = args.folds
+    if args.num_workers is not None:
+        config.num_workers = args.num_workers
 
     print(f"Device: {config.device}")
     print(f"Manifest: {config.manifest_csv}")
