@@ -12,7 +12,7 @@ class ModelConfig:
     # Visual encoder (CNN + ViT-B/16)
     vit_model: str = "google/vit-base-patch16-224"
     d_visual: int = 768
-    n_frames: int = 64                  # uniformly sampled frames per video
+    n_frames: int = 16                  # uniformly sampled frames per video (16 = 4× less CNN memory than 64)
     vit_n_layers: int = 4               # number of ViT encoder layers to use
     vit_unfreeze_last_n: int = 2        # unfreeze last N of those layers
     cnn_chunk_size: int = 32            # frames processed by CNN at once; caps peak GPU activation

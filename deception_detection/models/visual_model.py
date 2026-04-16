@@ -13,6 +13,7 @@ Architecture (adapted from DOLOS repo — NMS05/Audio-Visual-Deception-Detection
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from transformers import ViTModel
 
 
@@ -109,14 +110,26 @@ class ViT_Model(nn.Module):
         """
         B, T, C, H, W = frames.shape
 
-        # CNN feature extraction — processed in chunks to cap peak GPU activation.
-        # Naively flattening to (B*T, 3, 224, 224) and running the full CNN at once
-        # creates a stage-1 intermediate of (B*T, 64, 112, 112) ≈ 1.6 GB for B=8,T=64.
-        # Chunking to cnn_chunk_size (default 32) keeps it under ~102 MB.
+        # CNN feature extraction with gradient checkpointing.
+        #
+        # Problem: naively running self.cnn on all B*T frames at once fills the GPU
+        # with intermediate activations for the entire backward pass (~1.6 GB for
+        # B=8, T=64 at stage-1 alone). Chunking alone doesn't help backward: PyTorch
+        # still retains all chunk activations for torch.cat's gradient.
+        #
+        # Fix: gradient checkpointing — forward activations are discarded after each
+        # chunk's forward pass and recomputed on-the-fly during backward. This trades
+        # a small amount of extra compute (~30%) for a large reduction in peak VRAM.
+        # During eval (no grad needed) we skip checkpointing for speed.
         flat = frames.view(B * T, C, H, W)                          # (B*T, 3, 224, 224)
-        x = torch.cat(
-            [self.cnn(chunk) for chunk in flat.split(self.cnn_chunk_size)]
-        )                                                            # (B*T, 256)
+        chunks = flat.split(self.cnn_chunk_size)
+        if self.training:
+            x = torch.cat(
+                [grad_checkpoint(self.cnn, chunk, use_reentrant=False)
+                 for chunk in chunks]
+            )
+        else:
+            x = torch.cat([self.cnn(chunk) for chunk in chunks])    # (B*T, 256)
         x = x.view(B, T, 256)                                       # (B, T, 256)
 
         # Project + positional embedding
