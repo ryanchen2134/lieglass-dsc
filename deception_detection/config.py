@@ -20,14 +20,14 @@ class ModelConfig:
     # Cross-modal fusion
     d_cross: int = 256                  # projection dim inside CrossFusionModule
     d_fused: int = 512                  # output dim of CrossFusionModule
-    dropout: float = 0.4
+    dropout: float = 0.2
 
     # Training
     batch_size: int = 8
-    learning_rate: float = 5e-4
+    learning_rate: float = 5e-5
     weight_decay: float = 1e-2
     max_epochs: int = 200
-    patience: int = 50
+    patience: int = 30
     grad_clip: float = 1.0
     pos_weight: float = 2.33           # placeholder; recomputed per fold
     grad_accum_steps: int = 1          # gradient accumulation; effective_batch = batch_size × steps
