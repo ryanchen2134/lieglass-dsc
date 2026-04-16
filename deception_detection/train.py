@@ -206,6 +206,9 @@ def run_cross_validation(config: ModelConfig):
 
         # Model, optimizer, scheduler, AMP scaler
         model = FusionModel(config).to(device)
+        if torch.cuda.device_count() > 1:
+            print(f"  Using {torch.cuda.device_count()} GPUs (DataParallel)")
+            model = torch.nn.DataParallel(model)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = AdamW(trainable_params, lr=config.learning_rate, weight_decay=config.weight_decay)
 
@@ -250,7 +253,8 @@ def run_cross_validation(config: ModelConfig):
                 best_val_auc = val_metrics["auc_roc"]
                 best_metrics = val_metrics.copy()
                 patience_counter = 0
-                torch.save(model.state_dict(), ckpt_dir / f"fold_{fold}_best.pt")
+                state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+                torch.save(state, ckpt_dir / f"fold_{fold}_best.pt")
             else:
                 patience_counter += 1
                 if patience_counter >= config.patience:

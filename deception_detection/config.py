@@ -43,10 +43,9 @@ class ModelConfig:
     checkpoint_dir: str = "checkpoints"
 
     # DataLoader
-    # num_workers=0 is the safe default: OpenCV VideoCapture inside forked/spawned
-    # workers deadlocks on many Linux systems. Increase only if your OS + OpenCV
-    # build are confirmed to be fork-safe (e.g. after testing with num_workers=2).
-    num_workers: int = 0
+    # frames.npz fast-path (no OpenCV) makes num_workers > 0 safe.
+    # Set to 0 only if frames.npz is not yet generated for all samples.
+    num_workers: int = 4
 
     # Device
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
