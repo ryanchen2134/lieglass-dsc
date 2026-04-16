@@ -29,6 +29,16 @@ from .data.sampler import make_weighted_sampler
 from .models.fusion_model import FusionModel
 
 
+def _cuda_mem(tag: str) -> None:
+    """Print an abbreviated CUDA memory summary with a descriptive tag."""
+    if not torch.cuda.is_available():
+        return
+    print(f"\n{'='*60}")
+    print(f"[MEM] {tag}")
+    print(torch.cuda.memory_summary(abbreviated=True))
+    print('='*60)
+
+
 def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device,
                     grad_clip, grad_accum_steps=1, scaler=None):
     """
@@ -51,6 +61,11 @@ def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device,
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
+        if step == 0:
+            _cuda_mem(f"train step 0 — before model forward  "
+                      f"(batch_size={batch['frames'].shape[0]}, "
+                      f"n_frames={batch['frames'].shape[1]})")
+
         with torch.autocast(device_type=device_str, enabled=use_amp):
             logits = model(batch)   # (B,)
             loss   = F.binary_cross_entropy_with_logits(
@@ -61,10 +76,16 @@ def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device,
             # Scale loss for gradient accumulation so effective LR is unchanged
             loss = loss / grad_accum_steps
 
+        if step == 0:
+            _cuda_mem("train step 0 — after  model forward  / before backward")
+
         if use_amp:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+
+        if step == 0:
+            _cuda_mem("train step 0 — after  backward")
 
         # Unscale + update every grad_accum_steps batches (or on last batch)
         is_update_step = ((step + 1) % grad_accum_steps == 0
