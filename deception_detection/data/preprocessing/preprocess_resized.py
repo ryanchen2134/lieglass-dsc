@@ -79,17 +79,23 @@ def _try_extract_audio(source_video: Path, out_wav: Path, target_sr: int = 16000
         return False
 
 
-def _ensure_audio(sample_id: str, sample_dir: Path, row: dict):
+def _ensure_audio(sample_id: str, sample_dir: Path, row: dict, src_video: Path | None = None):
     """
     Guarantee features/{sample_id}/audio.wav exists.
     Priority:
       1. Already present → skip.
-      2. Extract from original DOLOS video (path-corrected from manifest).
-      3. Write 1-second silence as last resort.
+      2. Extract from src_video (the resized source — has original audio track).
+      3. Extract from original DOLOS video (path-corrected from manifest).
+      4. Write 1-second silence as last resort.
     """
     out_wav = sample_dir / "audio.wav"
     if out_wav.exists():
         return  # already done
+
+    # Try the resized source video first (it carries the original audio track)
+    if src_video is not None and src_video.exists():
+        if _try_extract_audio(src_video, out_wav):
+            return
 
     # Try original DOLOS path (correct /home/asdf → actual project root)
     raw_path = Path(row.get("video_path", ""))
@@ -134,7 +140,7 @@ def _process_sample(args: tuple) -> tuple[str, bool, str]:
             np.save(str(out_mask), mask)
 
         # --- Audio ---
-        _ensure_audio(sample_id, sample_dir, row_dict)
+        _ensure_audio(sample_id, sample_dir, row_dict, src_video=src_video)
 
         return sample_id, True, ""
     except Exception:
@@ -153,7 +159,7 @@ def _copy_video(src: Path, dst: Path):
             [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-i", str(src),
-                "-c:v", "libx264", "-crf", "18", "-an",
+                "-c:v", "libx264", "-crf", "18", "-c:a", "aac",
                 str(dst),
             ],
             capture_output=True, timeout=120,
