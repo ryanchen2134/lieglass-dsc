@@ -17,16 +17,6 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from transformers import ViTModel
 
 
-def _cuda_mem(tag: str) -> None:
-    """Print a CUDA memory summary (abbreviated) for the given tag."""
-    if not torch.cuda.is_available():
-        return
-    print(f"\n{'='*60}")
-    print(f"[MEM] {tag}")
-    print(torch.cuda.memory_summary(abbreviated=True))
-    print('='*60)
-
-
 def _conv_block(in_c: int, out_c: int) -> nn.Sequential:
     return nn.Sequential(
         nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False),
@@ -72,7 +62,6 @@ class ViT_Model(nn.Module):
         super().__init__()
         self.n_frames       = config.n_frames
         self.cnn_chunk_size = config.cnn_chunk_size  # cap peak CNN activation
-        self._mem_traced    = False   # print memory once on first training forward
 
         # Per-frame CNN (always trainable — randomly initialised)
         self.cnn = CNN_Face()
@@ -120,7 +109,6 @@ class ViT_Model(nn.Module):
             FloatTensor (B, 768) — (masked) mean-pooled visual embedding
         """
         B, T, C, H, W = frames.shape
-        trace = self.training and not self._mem_traced   # print once per model
 
         # CNN feature extraction with gradient checkpointing.
         #
@@ -133,9 +121,6 @@ class ViT_Model(nn.Module):
         # chunk's forward pass and recomputed on-the-fly during backward. This trades
         # a small amount of extra compute (~30%) for a large reduction in peak VRAM.
         # During eval (no grad needed) we skip checkpointing for speed.
-        if trace:
-            _cuda_mem(f"visual — before CNN  (B={B}, T={T}, chunk={self.cnn_chunk_size})")
-
         flat = frames.view(B * T, C, H, W)                          # (B*T, 3, 224, 224)
         chunks = flat.split(self.cnn_chunk_size)
         if self.training:
@@ -147,23 +132,14 @@ class ViT_Model(nn.Module):
             x = torch.cat([self.cnn(chunk) for chunk in chunks])    # (B*T, 256)
         x = x.view(B, T, 256)                                       # (B, T, 256)
 
-        if trace:
-            _cuda_mem(f"visual — after  CNN  / before ViT  ({len(self.vit_layers)} layers)")
-
         # Project + positional embedding
-        x = self.proj(x) + self.pos_embed  # (B, T, 768)
+        x = self.proj(x) + self.pos_embed[:, :T, :]  # (B, T, 768)
 
         # ViT encoder layers
         for layer in self.vit_layers:
             x = layer(x)[0]               # ViTLayer returns (hidden_states, ...)
 
-        if trace:
-            _cuda_mem("visual — after  ViT")
-
         x = self.norm(x)                   # (B, T, 768)
-
-        if trace:
-            self._mem_traced = True   # don't print again for subsequent batches
 
         # --- Masked mean pooling ---
         # Black frames (frame_mask == False) are excluded from the average so they
