@@ -30,7 +30,7 @@ from .models.fusion_model import FusionModel
 
 
 def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device,
-                    grad_clip, grad_accum_steps=1, scaler=None):
+                    grad_clip, grad_accum_steps=1, scaler=None, label_smoothing=0.0):
     """
     Train for one epoch with optional AMP (scaler) and gradient accumulation.
 
@@ -53,9 +53,12 @@ def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device,
 
         with torch.autocast(device_type=device_str, enabled=use_amp):
             logits = model(batch)   # (B,)
+            targets = batch["label"]
+            if label_smoothing > 0.0:
+                targets = targets * (1 - label_smoothing) + 0.5 * label_smoothing
             loss   = F.binary_cross_entropy_with_logits(
                 logits,
-                batch["label"],
+                targets,
                 pos_weight=pos_weight.to(device),
             )
             # Scale loss for gradient accumulation so effective LR is unchanged
@@ -231,6 +234,7 @@ def run_cross_validation(config: ModelConfig):
                 pos_weight, device, config.grad_clip,
                 grad_accum_steps=config.grad_accum_steps,
                 scaler=scaler,
+                label_smoothing=config.label_smoothing,
             )
             val_metrics = evaluate(model, val_loader, pos_weight, device)
 
