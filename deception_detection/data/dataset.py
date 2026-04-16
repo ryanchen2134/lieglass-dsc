@@ -147,15 +147,10 @@ class DeceptionDataset(Dataset):
         feat_path = self.feature_dir / sample_id
 
         # --- Audio: raw 16 kHz waveform ---
-        audio_path = feat_path / "audio.wav"
-        try:
-            waveform, sr = torchaudio.load(audio_path)
-            if sr != 16000:
-                waveform = torchaudio.functional.resample(waveform, sr, 16000)
-            waveform = waveform.squeeze(0)  # (T,)
-        except Exception:
-            # Missing / corrupt / LFS-pointer wav — return 1 s of silence
-            waveform = torch.zeros(16000)
+        waveform, sr = torchaudio.load(feat_path / "audio.wav")
+        if sr != 16000:
+            waveform = torchaudio.functional.resample(waveform, sr, 16000)
+        waveform = waveform.squeeze(0)  # (T,)
 
         # --- Visual: n frames + validity mask ---
         frames, frame_mask = _load_frames(feat_path, n=self.n_frames)
