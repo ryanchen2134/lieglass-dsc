@@ -34,10 +34,18 @@ def _load_frames(
     if npz_path.exists():
         # --- Fast path: load pre-extracted numpy archive ---
         data   = np.load(str(npz_path))
-        frames = data["frames"].astype(np.float32) / 255.0     # (n, H, W, 3)
+        frames_all = data["frames"]   # (N, H, W, 3) uint8
+        mask_all   = data["mask"]     # (N,) bool
+        N = len(frames_all)
+        if N != n:
+            # Uniformly subsample (or upsample) to exactly n frames
+            idx    = np.linspace(0, N - 1, n, dtype=int)
+            frames_all = frames_all[idx]
+            mask_all   = mask_all[idx]
+        frames = frames_all.astype(np.float32) / 255.0          # (n, H, W, 3)
         frames = (frames - _MEAN) / _STD                        # ImageNet normalise
         frames = np.ascontiguousarray(frames.transpose(0, 3, 1, 2))  # (n, 3, H, W)
-        return torch.from_numpy(frames), torch.from_numpy(data["mask"].copy())
+        return torch.from_numpy(frames), torch.from_numpy(mask_all.copy())
 
     # --- Fallback: OpenCV video decode ---
     return _sample_frames_opencv(
@@ -111,9 +119,10 @@ class DeceptionDataset(Dataset):
       sample_id   str
     """
 
-    def __init__(self, manifest_csv: str, feature_dir: str, augment: bool = False):
+    def __init__(self, manifest_csv: str, feature_dir: str, augment: bool = False, n_frames: int = 16):
         self.feature_dir = Path(feature_dir)
         self.augment     = augment
+        self.n_frames    = n_frames
         self.samples     = []
 
         with open(manifest_csv, newline="") as f:
@@ -139,7 +148,7 @@ class DeceptionDataset(Dataset):
         waveform = waveform.squeeze(0)  # (T,)
 
         # --- Visual: n frames + validity mask ---
-        frames, frame_mask = _load_frames(feat_path, n=64)  # (64,3,224,224), (64,)
+        frames, frame_mask = _load_frames(feat_path, n=self.n_frames)
 
         if self.augment:
             waveform   = self._augment_waveform(waveform)

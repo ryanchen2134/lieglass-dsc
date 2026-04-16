@@ -15,19 +15,9 @@ import torch.nn as nn
 from transformers import Wav2Vec2Model
 
 
-def _cuda_mem(tag: str) -> None:
-    if not torch.cuda.is_available():
-        return
-    print(f"\n{'='*60}")
-    print(f"[MEM] {tag}")
-    print(torch.cuda.memory_summary(abbreviated=True))
-    print('='*60)
-
-
 class W2V2_Model(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self._mem_traced = False   # print memory once on first training forward
         self.w2v2 = Wav2Vec2Model.from_pretrained(config.wav2vec2_model)
 
         # Freeze CNN feature extractor + feature projection always
@@ -58,16 +48,8 @@ class W2V2_Model(nn.Module):
         if attention_mask is not None:
             mask = attention_mask.long()
 
-        trace = self.training and not self._mem_traced
-        if trace:
-            _cuda_mem(f"audio — before Wav2Vec2  (B={waveform.shape[0]}, T={waveform.shape[1]})")
-
         outputs = self.w2v2(input_values=waveform, attention_mask=mask)
         hidden = outputs.last_hidden_state  # (B, T', 768)
-
-        if trace:
-            _cuda_mem(f"audio — after  Wav2Vec2  hidden={tuple(hidden.shape)}")
-            self._mem_traced = True
 
         if mask is not None:
             # Compute frame-level mask: Wav2Vec2 downsamples T by ~320
