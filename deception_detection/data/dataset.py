@@ -33,26 +33,31 @@ def _load_frames(
 
     if npz_path.exists():
         # --- Fast path: load pre-extracted numpy archive ---
-        data   = np.load(str(npz_path))
-        frames_all = data["frames"]   # (N, H, W, 3) uint8
-        mask_all   = data["mask"]     # (N,) bool
-        N = len(frames_all)
-        if N != n:
-            # Uniformly subsample (or upsample) to exactly n frames
-            idx    = np.linspace(0, N - 1, n, dtype=int)
-            frames_all = frames_all[idx]
-            mask_all   = mask_all[idx]
-        frames = frames_all.astype(np.float32) / 255.0          # (n, H, W, 3)
-        frames = (frames - _MEAN) / _STD                        # ImageNet normalise
-        frames = np.ascontiguousarray(frames.transpose(0, 3, 1, 2))  # (n, 3, H, W)
-        return torch.from_numpy(frames), torch.from_numpy(mask_all.copy())
+        try:
+            data   = np.load(str(npz_path))
+            frames_all = data["frames"]   # (N, H, W, 3) uint8
+            mask_all   = data["mask"]     # (N,) bool
+        except (EOFError, ValueError, KeyError):
+            # Corrupt / truncated npz — fall through to OpenCV or zeros
+            pass
+        else:
+            N = len(frames_all)
+            if N != n:
+                idx    = np.linspace(0, N - 1, n, dtype=int)
+                frames_all = frames_all[idx]
+                mask_all   = mask_all[idx]
+            frames = frames_all.astype(np.float32) / 255.0          # (n, H, W, 3)
+            frames = (frames - _MEAN) / _STD                        # ImageNet normalise
+            frames = np.ascontiguousarray(frames.transpose(0, 3, 1, 2))  # (n, 3, H, W)
+            return torch.from_numpy(frames), torch.from_numpy(mask_all.copy())
 
-    # --- Fallback: OpenCV video decode ---
-    return _sample_frames_opencv(
-        feat_path / "video.mp4",
-        feat_path / "frame_mask.npy",
-        n,
-    )
+    # --- Fallback: OpenCV video decode (or zeros if video is also missing) ---
+    video_path = feat_path / "video.mp4"
+    if video_path.exists() and video_path.stat().st_size > 200:
+        return _sample_frames_opencv(video_path, feat_path / "frame_mask.npy", n)
+
+    # No usable video source — return black frames with mask=False
+    return torch.zeros(n, 3, 224, 224), torch.zeros(n, dtype=torch.bool)
 
 
 def _sample_frames_opencv(
