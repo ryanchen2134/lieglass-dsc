@@ -21,41 +21,31 @@ from .visual_model import ViT_Model
 
 class CrossFusionModule(nn.Module):
     """
-    Plug-in Audio-Visual Fusion (PAVF) from DOLOS.
+    Gated audio-visual fusion.
 
-    Projects both embeddings to d_cross, computes batch-level cross-modal
-    attention (correlation matrix), applies residual fusion, and projects
-    to d_out.
+    Projects both embeddings to d_cross, then uses a learned gate to blend
+    them before projecting to d_out.  No batch-level operations — stable
+    with small batch sizes.
     """
 
     def __init__(self, d_audio: int = 768, d_visual: int = 768, d_cross: int = 256, d_out: int = 512):
         super().__init__()
         self.audio_proj  = nn.Linear(d_audio,  d_cross)
         self.visual_proj = nn.Linear(d_visual, d_cross)
-        self.scale = d_cross ** -0.5
-        self.out = nn.Linear(2 * d_cross, d_out)
+        # Gate: takes both projections → scalar per feature
+        self.gate = nn.Linear(2 * d_cross, d_cross)
+        self.out  = nn.Linear(2 * d_cross, d_out)
 
     def forward(self, audio: torch.Tensor, visual: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            audio:  FloatTensor (B, d_audio)
-            visual: FloatTensor (B, d_visual)
-
-        Returns:
-            FloatTensor (B, d_out)
-        """
         a = self.audio_proj(audio)    # (B, d_cross)
         v = self.visual_proj(visual)  # (B, d_cross)
 
-        # Batch-level cross-modal correlation (B, B)
-        corr = F.softmax(a @ v.t() * self.scale, dim=-1)   # (B, B)
-        corr_t = F.softmax(v @ a.t() * self.scale, dim=-1) # (B, B)
+        # Soft gate: how much audio vs visual to use per feature
+        g = torch.sigmoid(self.gate(torch.cat([a, v], dim=-1)))  # (B, d_cross)
+        a_gated = g * a
+        v_gated = (1 - g) * v
 
-        # Cross-attended features with residual
-        a_fused = a + corr   @ v  # (B, d_cross)
-        v_fused = v + corr_t @ a  # (B, d_cross)
-
-        fused = torch.cat([a_fused, v_fused], dim=-1)  # (B, 2*d_cross)
+        fused = torch.cat([a_gated, v_gated], dim=-1)  # (B, 2*d_cross)
         return self.out(fused)                          # (B, d_out)
 
 
