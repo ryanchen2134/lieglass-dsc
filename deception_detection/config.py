@@ -15,6 +15,7 @@ class ModelConfig:
     n_frames: int = 64                  # uniformly sampled frames per video
     vit_n_layers: int = 4               # number of ViT encoder layers to use
     vit_unfreeze_last_n: int = 2        # unfreeze last N of those layers
+    cnn_chunk_size: int = 32            # frames processed by CNN at once; caps peak GPU activation
 
     # Cross-modal fusion
     d_cross: int = 256                  # projection dim inside CrossFusionModule
@@ -29,6 +30,7 @@ class ModelConfig:
     patience: int = 50
     grad_clip: float = 1.0
     pos_weight: float = 2.33           # placeholder; recomputed per fold
+    grad_accum_steps: int = 1          # gradient accumulation; effective_batch = batch_size × steps
 
     # Cross-validation
     n_folds: int = 8

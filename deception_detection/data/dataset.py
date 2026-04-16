@@ -5,25 +5,60 @@ import torchaudio
 from torch.utils.data import Dataset
 from pathlib import Path
 
+# ImageNet normalisation constants (float32, shape (3,) for broadcasting)
+_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-def _sample_frames(
-    video_path: Path,
-    mask_path: Path | None,
+
+def _load_frames(
+    feat_path: Path,
     n: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Uniformly sample `n` frames from a video file.
+    Load n uniformly-sampled face frames + validity mask for one sample.
+
+    Fast path (preferred):
+        Reads features/{id}/frames.npz produced by extract_frames.py.
+        Pure numpy — no OpenCV, no video I/O → safe for num_workers > 0.
+
+    Fallback:
+        Decodes video.mp4 with OpenCV and loads frame_mask.npy.
+        Used when frames.npz is not yet available.
 
     Returns:
-        frames     FloatTensor (n, 3, 224, 224) — ImageNet-normalised RGB frames
-        frame_mask BoolTensor  (n,)             — True = speaker visible (not black frame)
+        frames     FloatTensor (n, 3, 224, 224) — ImageNet-normalised RGB
+        frame_mask BoolTensor  (n,)             — True = speaker visible
+    """
+    npz_path = feat_path / "frames.npz"
 
-    frame_mask is derived from frame_mask.npy if available; otherwise all-True
-    (assume every frame is valid).
+    if npz_path.exists():
+        # --- Fast path: load pre-extracted numpy archive ---
+        data   = np.load(str(npz_path))
+        frames = data["frames"].astype(np.float32) / 255.0     # (n, H, W, 3)
+        frames = (frames - _MEAN) / _STD                        # ImageNet normalise
+        frames = np.ascontiguousarray(frames.transpose(0, 3, 1, 2))  # (n, 3, H, W)
+        return torch.from_numpy(frames), torch.from_numpy(data["mask"].copy())
+
+    # --- Fallback: OpenCV video decode ---
+    return _sample_frames_opencv(
+        feat_path / "video.mp4",
+        feat_path / "frame_mask.npy",
+        n,
+    )
+
+
+def _sample_frames_opencv(
+    video_path: Path,
+    mask_path: Path | None,
+    n: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Decode video_path with OpenCV, uniformly sample n frames.
+    NOTE: OpenCV is not fork-safe; keep num_workers=0 when using this path.
     """
     import cv2
 
-    cap = cv2.VideoCapture(str(video_path))
+    cap   = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     if total <= 0:
@@ -32,17 +67,13 @@ def _sample_frames(
 
     indices = np.linspace(0, total - 1, n, dtype=int)
 
-    # --- Frame mask sampled at same indices ---
+    # Co-sample frame_mask.npy at the same frame indices
     if mask_path is not None and mask_path.exists():
-        full_mask = np.load(str(mask_path))          # (n_frames,) bool
-        # Clip in case mask length differs slightly from frame count
-        clipped = np.clip(indices, 0, len(full_mask) - 1)
+        full_mask    = np.load(str(mask_path))
+        clipped      = np.clip(indices, 0, len(full_mask) - 1)
         sampled_mask = torch.from_numpy(full_mask[clipped].copy())
     else:
         sampled_mask = torch.ones(n, dtype=torch.bool)
-
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
     frames = []
     for idx in indices:
@@ -54,32 +85,36 @@ def _sample_frames(
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = cv2.resize(frame, (224, 224))
         frame = frame.astype(np.float32) / 255.0
-        frame = (frame - mean) / std
+        frame = (frame - _MEAN) / _STD
         frames.append(frame)
 
     cap.release()
 
-    arr = np.stack(frames)               # (n, 224, 224, 3)
-    arr = arr.transpose(0, 3, 1, 2)     # (n, 3, 224, 224)
+    arr = np.stack(frames)                                   # (n, 224, 224, 3)
+    arr = np.ascontiguousarray(arr.transpose(0, 3, 1, 2))  # (n, 3, 224, 224)
     return torch.from_numpy(arr), sampled_mask
 
 
 class DeceptionDataset(Dataset):
     """
-    Loads audio.wav and video.mp4 from pre-processed feature directories.
-    Each __getitem__ returns a dict with waveform, frames, label, and sample_id.
+    Loads audio.wav and face frames from pre-processed feature directories.
+
+    Visual loading priority:
+      1. frames.npz  (fast, no OpenCV — run extract_frames.py first)
+      2. video.mp4   (OpenCV fallback — requires num_workers=0)
+
+    Each __getitem__ returns a dict with:
+      waveform    FloatTensor (T,)
+      frames      FloatTensor (n_frames, 3, 224, 224)
+      frame_mask  BoolTensor  (n_frames,)  True = speaker visible
+      label       FloatTensor scalar
+      sample_id   str
     """
 
     def __init__(self, manifest_csv: str, feature_dir: str, augment: bool = False):
-        """
-        Args:
-            manifest_csv: CSV with columns [sample_id, label, dataset_source, ...].
-            feature_dir:  Root dir containing per-sample feature folders.
-            augment:      Whether to apply data augmentation (training only).
-        """
         self.feature_dir = Path(feature_dir)
-        self.augment = augment
-        self.samples = []
+        self.augment     = augment
+        self.samples     = []
 
         with open(manifest_csv, newline="") as f:
             reader = csv.DictReader(f)
@@ -103,22 +138,18 @@ class DeceptionDataset(Dataset):
             waveform = torchaudio.functional.resample(waveform, sr, 16000)
         waveform = waveform.squeeze(0)  # (T,)
 
-        # --- Visual: 64 uniformly sampled face frames + mask ---
-        frames, frame_mask = _sample_frames(
-            feat_path / "video.mp4",
-            feat_path / "frame_mask.npy",
-            n=64,
-        )  # (64, 3, 224, 224), (64,)
+        # --- Visual: n frames + validity mask ---
+        frames, frame_mask = _load_frames(feat_path, n=64)  # (64,3,224,224), (64,)
 
         if self.augment:
-            waveform = self._augment_waveform(waveform)
-            frames   = self._augment_frames(frames)
+            waveform   = self._augment_waveform(waveform)
+            frames     = self._augment_frames(frames)
 
         return {
-            "waveform":   waveform,                                    # FloatTensor (T,)
-            "frames":     frames,                                      # FloatTensor (64, 3, 224, 224)
-            "frame_mask": frame_mask,                                  # BoolTensor  (64,)
-            "label":      torch.tensor(label, dtype=torch.float32),   # scalar
+            "waveform":   waveform,
+            "frames":     frames,
+            "frame_mask": frame_mask,
+            "label":      torch.tensor(label, dtype=torch.float32),
             "sample_id":  sample_id,
         }
 

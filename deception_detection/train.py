@@ -29,38 +29,65 @@ from .data.sampler import make_weighted_sampler
 from .models.fusion_model import FusionModel
 
 
-def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device, grad_clip):
+def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device,
+                    grad_clip, grad_accum_steps=1, scaler=None):
+    """
+    Train for one epoch with optional AMP (scaler) and gradient accumulation.
+
+    grad_accum_steps > 1: gradients are accumulated across that many mini-batches
+    before a parameter update, giving an effective batch size of
+    batch_size × grad_accum_steps with lower peak memory per step.
+    """
     model.train()
+    use_amp    = scaler is not None
+    device_str = device.type   # "cuda" or "cpu"
     total_loss = 0.0
-    all_preds = []
+    all_preds  = []
     all_labels = []
-    print(f"    Training on {len(loader.dataset)} samples ({len(loader)} batches)...")
-    for i, batch in enumerate(loader):
-        print(f"    Batch {i+1}/{len(loader)}", end="\r")
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        print(" " * 50, end="\r")  # Clear line after batch processing
-        logits = model(batch)  # (B,)
-        print(f"    Logits range: [{logits.min().item():.2f}, {logits.max().item():.2f}]")
-        loss = F.binary_cross_entropy_with_logits(
-            logits,
-            batch["label"],
-            pos_weight=pos_weight.to(device),
-        )
-        print(f"    Batch raw loss: {loss.item():.4f}")
 
-        optimizer.zero_grad()
-        loss.backward()
-        print(f"    Batch loss: {loss.item():.4f}")
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        optimizer.step()
-        scheduler.step()
+    optimizer.zero_grad()
 
-        total_loss += loss.item() * logits.size(0)
+    for step, batch in enumerate(loader):
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+
+        with torch.autocast(device_type=device_str, enabled=use_amp):
+            logits = model(batch)   # (B,)
+            loss   = F.binary_cross_entropy_with_logits(
+                logits,
+                batch["label"],
+                pos_weight=pos_weight.to(device),
+            )
+            # Scale loss for gradient accumulation so effective LR is unchanged
+            loss = loss / grad_accum_steps
+
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # Unscale + update every grad_accum_steps batches (or on last batch)
+        is_update_step = ((step + 1) % grad_accum_steps == 0
+                          or (step + 1) == len(loader))
+        if is_update_step:
+            if use_amp:
+                scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        # Track unscaled loss (multiply back)
+        total_loss += loss.item() * grad_accum_steps * logits.size(0)
         preds = torch.sigmoid(logits).detach().cpu()
         all_preds.extend(preds.tolist())
         all_labels.extend(batch["label"].cpu().tolist())
 
-    avg_loss = total_loss / len(all_labels)
+    avg_loss = total_loss / max(len(all_labels), 1)
     acc = accuracy_score(all_labels, [1 if p > 0.5 else 0 for p in all_preds])
     return avg_loss, acc
 
@@ -174,17 +201,24 @@ def run_cross_validation(config: ModelConfig):
             persistent_workers=config.num_workers > 0,
         )
 
-        # Model, optimizer, scheduler
+        # Model, optimizer, scheduler, AMP scaler
         model = FusionModel(config).to(device)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = AdamW(trainable_params, lr=config.learning_rate, weight_decay=config.weight_decay)
-        total_steps = config.max_epochs * len(train_loader)
+
+        # OneCycleLR counts parameter updates, not raw batches.
+        # With gradient accumulation, one update happens every grad_accum_steps batches.
+        updates_per_epoch = max(1, len(train_loader) // config.grad_accum_steps)
+        total_steps = config.max_epochs * updates_per_epoch
         scheduler = OneCycleLR(
             optimizer,
             max_lr=config.learning_rate,
             total_steps=total_steps,
             pct_start=0.1,
         )
+
+        # Automatic Mixed Precision — enabled only on CUDA; no-ops on CPU
+        scaler = torch.amp.GradScaler(device.type, enabled=(device.type == "cuda"))
 
         best_val_auc = 0.0
         best_metrics = {}
@@ -195,6 +229,8 @@ def run_cross_validation(config: ModelConfig):
             train_loss, train_acc = train_one_epoch(
                 model, train_loader, optimizer, scheduler,
                 pos_weight, device, config.grad_clip,
+                grad_accum_steps=config.grad_accum_steps,
+                scaler=scaler,
             )
             val_metrics = evaluate(model, val_loader, pos_weight, device)
 
@@ -251,8 +287,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--folds", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None,
-                        help="DataLoader workers (default 0; increase only if OpenCV "
-                             "multiprocessing works on your system)")
+                        help="DataLoader workers (0=safe default; 4 after extract_frames.py)")
+    parser.add_argument("--grad_accum", type=int, default=None,
+                        help="Gradient accumulation steps (effective_batch = batch_size × steps)")
     args = parser.parse_args()
 
     config = ModelConfig()
@@ -272,10 +309,17 @@ def main():
         config.n_folds = args.folds
     if args.num_workers is not None:
         config.num_workers = args.num_workers
+    if args.grad_accum is not None:
+        config.grad_accum_steps = args.grad_accum
 
-    print(f"Device: {config.device}")
-    print(f"Manifest: {config.manifest_csv}")
-    print(f"Features: {config.feature_dir}")
+    print(f"Device:          {config.device}")
+    print(f"Manifest:        {config.manifest_csv}")
+    print(f"Features:        {config.feature_dir}")
+    print(f"Batch size:      {config.batch_size}  "
+          f"(effective {config.batch_size * config.grad_accum_steps} "
+          f"with grad_accum={config.grad_accum_steps})")
+    print(f"num_workers:     {config.num_workers}")
+    print(f"cnn_chunk_size:  {config.cnn_chunk_size}")
 
     run_cross_validation(config)
 

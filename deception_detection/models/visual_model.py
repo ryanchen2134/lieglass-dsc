@@ -59,7 +59,8 @@ class CNN_Face(nn.Module):
 class ViT_Model(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.n_frames = config.n_frames
+        self.n_frames       = config.n_frames
+        self.cnn_chunk_size = config.cnn_chunk_size  # cap peak CNN activation
 
         # Per-frame CNN (always trainable — randomly initialised)
         self.cnn = CNN_Face()
@@ -108,10 +109,15 @@ class ViT_Model(nn.Module):
         """
         B, T, C, H, W = frames.shape
 
-        # CNN feature extraction: process all frames in one batch
-        x = frames.view(B * T, C, H, W)   # (B*T, 3, 224, 224)
-        x = self.cnn(x)                    # (B*T, 256)
-        x = x.view(B, T, 256)             # (B, T, 256)
+        # CNN feature extraction — processed in chunks to cap peak GPU activation.
+        # Naively flattening to (B*T, 3, 224, 224) and running the full CNN at once
+        # creates a stage-1 intermediate of (B*T, 64, 112, 112) ≈ 1.6 GB for B=8,T=64.
+        # Chunking to cnn_chunk_size (default 32) keeps it under ~102 MB.
+        flat = frames.view(B * T, C, H, W)                          # (B*T, 3, 224, 224)
+        x = torch.cat(
+            [self.cnn(chunk) for chunk in flat.split(self.cnn_chunk_size)]
+        )                                                            # (B*T, 256)
+        x = x.view(B, T, 256)                                       # (B, T, 256)
 
         # Project + positional embedding
         x = self.proj(x) + self.pos_embed  # (B, T, 768)
