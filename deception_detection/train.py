@@ -282,13 +282,13 @@ def run_cross_validation(config: ModelConfig):
 
 
 def main():
-    #cuda device:
     if torch.cuda.is_available():
-        device = torch.cuda.current_device()
-        print(f"Using CUDA device {device}: {torch.cuda.get_device_name(device)}")
+        n_gpus = torch.cuda.device_count()
+        for i in range(n_gpus):
+            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+        print(f"DataParallel: {'yes' if n_gpus > 1 else 'no (single GPU)'}")
     else:
         print("CUDA not available, using CPU")
-        device = "cpu"
     
     
     parser = argparse.ArgumentParser()
