@@ -257,6 +257,11 @@ def run_cross_validation(config: ModelConfig):
               f"f1={best_metrics.get('f1', 0):.3f} acc={best_metrics.get('accuracy', 0):.3f}")
         fold_metrics.append(best_metrics)
 
+        # Free GPU memory before the next fold's model is allocated
+        del model, optimizer, scheduler, scaler
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     # Aggregate
     print("\n" + "="*60)
     print("Cross-Validation Results")
@@ -290,6 +295,8 @@ def main():
                         help="DataLoader workers (0=safe default; 4 after extract_frames.py)")
     parser.add_argument("--grad_accum", type=int, default=None,
                         help="Gradient accumulation steps (effective_batch = batch_size × steps)")
+    parser.add_argument("--n_frames", type=int, default=None,
+                        help="Frames sampled per video (default 16; use 64 for max quality)")
     args = parser.parse_args()
 
     config = ModelConfig()
@@ -311,6 +318,8 @@ def main():
         config.num_workers = args.num_workers
     if args.grad_accum is not None:
         config.grad_accum_steps = args.grad_accum
+    if args.n_frames is not None:
+        config.n_frames = args.n_frames
 
     print(f"Device:          {config.device}")
     print(f"Manifest:        {config.manifest_csv}")
@@ -319,6 +328,7 @@ def main():
           f"(effective {config.batch_size * config.grad_accum_steps} "
           f"with grad_accum={config.grad_accum_steps})")
     print(f"num_workers:     {config.num_workers}")
+    print(f"n_frames:        {config.n_frames}")
     print(f"cnn_chunk_size:  {config.cnn_chunk_size}")
 
     run_cross_validation(config)
