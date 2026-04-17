@@ -7,14 +7,14 @@ class ModelConfig:
     # Wav2Vec2 audio encoder
     wav2vec2_model: str = "facebook/wav2vec2-base"
     d_audio: int = 768
-    wav2vec2_unfreeze_last_n: int = 2   # unfreeze last N transformer layers
+    wav2vec2_unfreeze_last_n: int = 0   # 0 = fully frozen; fine-tune after initial training
 
     # Visual encoder (CNN + ViT-B/16)
     vit_model: str = "google/vit-base-patch16-224"
     d_visual: int = 768
     n_frames: int = 16                  # uniformly sampled frames per video (16 = 4× less CNN memory than 64)
     vit_n_layers: int = 4               # number of ViT encoder layers to use
-    vit_unfreeze_last_n: int = 2        # unfreeze last N of those layers
+    vit_unfreeze_last_n: int = 0        # 0 = fully frozen; fine-tune after initial training
     cnn_chunk_size: int = 32            # frames processed by CNN at once; caps peak GPU activation
 
     # Cross-modal fusion
@@ -24,7 +24,7 @@ class ModelConfig:
 
     # Training
     batch_size: int = 8
-    learning_rate: float = 5e-5
+    learning_rate: float = 1e-4
     weight_decay: float = 1e-2
     max_epochs: int = 200
     patience: int = 30
