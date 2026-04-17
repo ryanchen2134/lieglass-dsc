@@ -245,6 +245,8 @@ def run_cross_validation(config: ModelConfig):
         train_sampler = make_weighted_sampler(train_labels)
 
         pin = device.type == "cuda"
+        # prefetch_factor is only valid when num_workers > 0
+        extra = {"prefetch_factor": config.prefetch_factor} if config.num_workers > 0 else {}
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
@@ -254,6 +256,7 @@ def run_cross_validation(config: ModelConfig):
             pin_memory=pin,
             persistent_workers=config.num_workers > 0,
             drop_last=True,
+            **extra,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -263,6 +266,7 @@ def run_cross_validation(config: ModelConfig):
             num_workers=config.num_workers,
             pin_memory=pin,
             persistent_workers=config.num_workers > 0,
+            **extra,
         )
 
         # Model, optimizer, scheduler, AMP scaler

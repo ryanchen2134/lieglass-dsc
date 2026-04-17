@@ -5,10 +5,6 @@ import torchaudio
 from torch.utils.data import Dataset
 from pathlib import Path
 
-# ImageNet normalisation constants (float32, shape (3,) for broadcasting)
-_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
 
 def _load_frames(
     feat_path: Path,
@@ -16,6 +12,10 @@ def _load_frames(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Load n uniformly-sampled face frames + validity mask for one sample.
+
+    Returns uint8 frames — 4× smaller pinned-memory transfer than float32.
+    Normalisation (uint8 → ImageNet-normed float32) happens on GPU inside
+    FusionModel.forward.
 
     Fast path (preferred):
         Reads features/{id}/frames.npz produced by extract_frames.py.
@@ -26,7 +26,7 @@ def _load_frames(
         Used when frames.npz is not yet available.
 
     Returns:
-        frames     FloatTensor (n, 3, 224, 224) — ImageNet-normalised RGB
+        frames     ByteTensor  (n, 3, 224, 224) — raw RGB uint8
         frame_mask BoolTensor  (n,)             — True = speaker visible
     """
     npz_path = feat_path / "frames.npz"
@@ -46,9 +46,8 @@ def _load_frames(
                 idx    = np.linspace(0, N - 1, n, dtype=int)
                 frames_all = frames_all[idx]
                 mask_all   = mask_all[idx]
-            frames = frames_all.astype(np.float32) / 255.0          # (n, H, W, 3)
-            frames = (frames - _MEAN) / _STD                        # ImageNet normalise
-            frames = np.ascontiguousarray(frames.transpose(0, 3, 1, 2))  # (n, 3, H, W)
+            # (n, H, W, 3) uint8 → (n, 3, H, W) uint8 — no float conversion here
+            frames = np.ascontiguousarray(frames_all.transpose(0, 3, 1, 2))
             return torch.from_numpy(frames), torch.from_numpy(mask_all.copy())
 
     # --- Fallback: OpenCV video decode (or zeros if video is also missing) ---
@@ -56,8 +55,8 @@ def _load_frames(
     if video_path.exists() and video_path.stat().st_size > 200:
         return _sample_frames_opencv(video_path, feat_path / "frame_mask.npy", n)
 
-    # No usable video source — return black frames with mask=False
-    return torch.zeros(n, 3, 224, 224), torch.zeros(n, dtype=torch.bool)
+    # No usable video source — return black uint8 frames with mask=False
+    return torch.zeros(n, 3, 224, 224, dtype=torch.uint8), torch.zeros(n, dtype=torch.bool)
 
 
 def _sample_frames_opencv(
@@ -68,6 +67,7 @@ def _sample_frames_opencv(
     """
     Decode video_path with OpenCV, uniformly sample n frames.
     NOTE: OpenCV is not fork-safe; keep num_workers=0 when using this path.
+    Returns uint8 frames — normalisation happens on GPU.
     """
     import cv2
 
@@ -76,7 +76,7 @@ def _sample_frames_opencv(
 
     if total <= 0:
         cap.release()
-        return torch.zeros(n, 3, 224, 224), torch.ones(n, dtype=torch.bool)
+        return torch.zeros(n, 3, 224, 224, dtype=torch.uint8), torch.ones(n, dtype=torch.bool)
 
     indices = np.linspace(0, total - 1, n, dtype=int)
 
@@ -93,18 +93,16 @@ def _sample_frames_opencv(
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ret, frame = cap.read()
         if not ret:
-            frames.append(np.zeros((224, 224, 3), dtype=np.float32))
+            frames.append(np.zeros((224, 224, 3), dtype=np.uint8))
             continue
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = cv2.resize(frame, (224, 224))
-        frame = frame.astype(np.float32) / 255.0
-        frame = (frame - _MEAN) / _STD
         frames.append(frame)
 
     cap.release()
 
-    arr = np.stack(frames)                                   # (n, 224, 224, 3)
-    arr = np.ascontiguousarray(arr.transpose(0, 3, 1, 2))  # (n, 3, 224, 224)
+    arr = np.stack(frames)                                 # (n, 224, 224, 3) uint8
+    arr = np.ascontiguousarray(arr.transpose(0, 3, 1, 2))  # (n, 3, 224, 224) uint8
     return torch.from_numpy(arr), sampled_mask
 
 
@@ -156,8 +154,9 @@ class DeceptionDataset(Dataset):
         frames, frame_mask = _load_frames(feat_path, n=self.n_frames)
 
         if self.augment:
-            waveform   = self._augment_waveform(waveform)
-            frames     = self._augment_frames(frames)
+            waveform = self._augment_waveform(waveform)
+            # Frame noise augmentation runs on GPU after uint8 → float normalisation
+            # (see FusionModel.forward).
 
         return {
             "waveform":   waveform,
@@ -171,8 +170,3 @@ class DeceptionDataset(Dataset):
         """Light additive noise augmentation for audio."""
         sigma = torch.empty(1).uniform_(0.0, 0.005).item()
         return waveform + torch.randn_like(waveform) * sigma
-
-    def _augment_frames(self, frames: torch.Tensor) -> torch.Tensor:
-        """Light pixel-noise augmentation for frames (after normalisation)."""
-        sigma = torch.empty(1).uniform_(0.0, 0.02).item()
-        return frames + torch.randn_like(frames) * sigma
