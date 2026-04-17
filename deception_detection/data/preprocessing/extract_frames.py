@@ -54,7 +54,7 @@ def _extract(args: tuple) -> tuple[str, bool, str]:
             cap.release()
             frames_arr = np.zeros((n_frames, 224, 224, 3), dtype=np.uint8)
             mask_arr   = np.zeros(n_frames, dtype=bool)
-            np.savez_compressed(str(out), frames=frames_arr, mask=mask_arr)
+            np.savez(str(out), frames=frames_arr, mask=mask_arr)
             return sample_id, True, ""
 
         indices = np.linspace(0, total - 1, n_frames, dtype=int)
@@ -74,7 +74,7 @@ def _extract(args: tuple) -> tuple[str, bool, str]:
             mask.append(is_visible)
 
         cap.release()
-        np.savez_compressed(
+        np.savez(
             str(out),
             frames=np.stack(frames),            # (n, 224, 224, 3) uint8
             mask=np.array(mask, dtype=bool),    # (n,)

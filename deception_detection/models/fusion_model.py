@@ -70,13 +70,26 @@ class FusionModel(nn.Module):
             nn.Linear(128, 1),
         )
 
+        # ImageNet normalisation constants, registered as buffers so they
+        # move to the correct device with the model (incl. DataParallel replicas).
+        self.register_buffer(
+            "_img_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_img_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1),
+            persistent=False,
+        )
+
     def forward(self, batch: dict) -> torch.Tensor:
         """
         Args:
             batch: dict with keys:
                 waveform        FloatTensor (B, T)
                 waveform_mask   BoolTensor  (B, T)   True=valid  (optional)
-                frames          FloatTensor (B, n_frames, 3, 224, 224)
+                frames          ByteTensor  (B, n_frames, 3, 224, 224)  uint8 RGB
                 frame_mask      BoolTensor  (B, n_frames)  True=speaker visible (optional)
 
         Returns:
@@ -86,6 +99,11 @@ class FusionModel(nn.Module):
         frames   = batch["frames"]
         waveform_mask = batch.get("waveform_mask")
         frame_mask    = batch.get("frame_mask")      # (B, n_frames) bool or None
+
+        # GPU-side uint8 → ImageNet-normalised float. Avoids a 4× larger
+        # CPU→GPU transfer and a costly CPU float conversion.
+        if frames.dtype == torch.uint8:
+            frames = frames.float().div_(255.0).sub_(self._img_mean).div_(self._img_std)
 
         audio_emb  = self.audio_model(waveform, waveform_mask)   # (B, 768)
         visual_emb = self.visual_model(frames, frame_mask)        # (B, 768)

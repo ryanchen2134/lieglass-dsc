@@ -45,7 +45,8 @@ class ModelConfig:
     # DataLoader
     # frames.npz fast-path (no OpenCV) makes num_workers > 0 safe.
     # Set to 0 only if frames.npz is not yet generated for all samples.
-    num_workers: int = 4
+    num_workers: int = 8
+    prefetch_factor: int = 4          # batches prefetched per worker
 
     # Device
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
