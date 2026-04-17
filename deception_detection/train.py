@@ -210,6 +210,9 @@ def run_cross_validation(config: ModelConfig):
             print(f"  Using {torch.cuda.device_count()} GPUs (DataParallel)")
             model = torch.nn.DataParallel(model)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
+        n_trainable = sum(p.numel() for p in trainable_params)
+        n_total = sum(p.numel() for p in model.parameters())
+        print(f"  Trainable params: {n_trainable:,} / {n_total:,} ({100*n_trainable/n_total:.1f}%)", flush=True)
         optimizer = AdamW(trainable_params, lr=config.learning_rate, weight_decay=config.weight_decay)
 
         # OneCycleLR counts parameter updates, not raw batches.
