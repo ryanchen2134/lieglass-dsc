@@ -221,7 +221,7 @@ def run_cross_validation(config: ModelConfig):
         skf = StratifiedKFold(n_splits=config.n_folds, shuffle=True, random_state=config.seed)
         splits = list(skf.split(indices, labels))
     fold_metrics = []
-    monitor = _GPUMonitor(interval=10)
+    monitor = _GPUMonitor(interval=2)
     monitor.start()
 
     for fold, (train_idx, val_idx) in enumerate(splits):
@@ -313,8 +313,10 @@ def run_cross_validation(config: ModelConfig):
             val_metrics = evaluate(model, val_loader, pos_weight, device)
             gpu_info = monitor.epoch_summary()
 
+            cur_lr = scheduler.get_last_lr()[0]
             print(
                 f"  Epoch {epoch+1:3d} | "
+                f"lr={cur_lr:.2e} "
                 f"train_loss={train_loss:.4f} train_acc={train_acc:.3f} | "
                 f"val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['accuracy']:.3f} "
                 f"val_f1={val_metrics['f1']:.3f} val_auc={val_metrics['auc_roc']:.3f} "
