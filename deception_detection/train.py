@@ -12,6 +12,7 @@ Or use default paths from config.py.
 
 import argparse
 import os
+import threading
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -27,6 +28,64 @@ from .data.dataset import DeceptionDataset
 from .data.collate import collate_fn
 from .data.sampler import make_weighted_sampler
 from .models.fusion_model import FusionModel
+
+
+class _GPUMonitor:
+    """
+    Background thread that samples GPU utilisation and VRAM every `interval`
+    seconds via pynvml (falls back to torch VRAM-only if pynvml is absent).
+    Call reset_epoch() before each epoch and epoch_summary() after it.
+    """
+
+    def __init__(self, interval: int = 10):
+        self.interval  = interval
+        self._n_gpus   = torch.cuda.device_count()
+        self._samples: list[dict] = []
+        self._lock     = threading.Lock()
+        self._stop     = threading.Event()
+        self._thread   = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        if self._n_gpus > 0:
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def reset_epoch(self):
+        with self._lock:
+            self._samples.clear()
+
+    def epoch_summary(self) -> str:
+        with self._lock:
+            samples = list(self._samples)
+        if not samples:
+            return ""
+        avg_util = [sum(s["util"][i] for s in samples) / len(samples) for i in range(self._n_gpus)]
+        avg_mem  = [sum(s["mem"][i]  for s in samples) / len(samples) for i in range(self._n_gpus)]
+        import math
+        util_str = "/".join("--" if math.isnan(u) else f"{u:.0f}%" for u in avg_util)
+        mem_str  = "/".join(f"{m:.1f}G" for m in avg_mem)
+        return f"gpu={util_str} vram={mem_str}"
+
+    def _run(self):
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(self._n_gpus)]
+            while not self._stop.wait(self.interval):
+                util = [pynvml.nvmlDeviceGetUtilizationRates(h).gpu for h in handles]
+                mem  = [pynvml.nvmlDeviceGetMemoryInfo(h).used / 1024 ** 3 for h in handles]
+                with self._lock:
+                    self._samples.append({"util": util, "mem": mem})
+        except ImportError:
+            # pynvml unavailable — report VRAM from torch (util shown as --)
+            while not self._stop.wait(self.interval):
+                mem = [torch.cuda.memory_reserved(i) / 1024 ** 3 for i in range(self._n_gpus)]
+                with self._lock:
+                    self._samples.append({"util": [float("nan")] * self._n_gpus, "mem": mem})
+        except Exception:
+            pass
 
 
 def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device,
@@ -162,6 +221,8 @@ def run_cross_validation(config: ModelConfig):
         skf = StratifiedKFold(n_splits=config.n_folds, shuffle=True, random_state=config.seed)
         splits = list(skf.split(indices, labels))
     fold_metrics = []
+    monitor = _GPUMonitor(interval=10)
+    monitor.start()
 
     for fold, (train_idx, val_idx) in enumerate(splits):
         print(f"\n{'='*60}", flush=True)
@@ -206,8 +267,10 @@ def run_cross_validation(config: ModelConfig):
 
         # Model, optimizer, scheduler, AMP scaler
         model = FusionModel(config).to(device)
+        if hasattr(torch, "compile"):
+            model = torch.compile(model)
         if torch.cuda.device_count() > 1:
-            print(f"  Using {torch.cuda.device_count()} GPUs (DataParallel)")
+            print(f"  Using {torch.cuda.device_count()} GPUs (DataParallel)", flush=True)
             model = torch.nn.DataParallel(model)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         n_trainable = sum(p.numel() for p in trainable_params)
@@ -234,6 +297,7 @@ def run_cross_validation(config: ModelConfig):
         patience_counter = 0
 
         for epoch in range(config.max_epochs):
+            monitor.reset_epoch()
             print(f"  Epoch {epoch+1}/{config.max_epochs}", flush=True)
             train_loss, train_acc = train_one_epoch(
                 model, train_loader, optimizer, scheduler,
@@ -243,13 +307,15 @@ def run_cross_validation(config: ModelConfig):
                 label_smoothing=config.label_smoothing,
             )
             val_metrics = evaluate(model, val_loader, pos_weight, device)
+            gpu_info = monitor.epoch_summary()
 
             print(
                 f"  Epoch {epoch+1:3d} | "
                 f"train_loss={train_loss:.4f} train_acc={train_acc:.3f} | "
                 f"val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['accuracy']:.3f} "
                 f"val_f1={val_metrics['f1']:.3f} val_auc={val_metrics['auc_roc']:.3f} "
-                f"logit_μ={val_metrics['logit_mean']:+.2f} logit_σ={val_metrics['logit_std']:.2f}",
+                f"logit_μ={val_metrics['logit_mean']:+.2f} logit_σ={val_metrics['logit_std']:.2f}"
+                + (f" | {gpu_info}" if gpu_info else ""),
                 flush=True,
             )
 
@@ -273,6 +339,8 @@ def run_cross_validation(config: ModelConfig):
         del model, optimizer, scheduler, scaler
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    monitor.stop()
 
     # Aggregate
     print("\n" + "="*60)
