@@ -164,9 +164,9 @@ def run_cross_validation(config: ModelConfig):
     fold_metrics = []
 
     for fold, (train_idx, val_idx) in enumerate(splits):
-        print(f"\n{'='*60}")
-        print(f"Fold {fold + 1}/{len(splits)}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", flush=True)
+        print(f"Fold {fold + 1}/{len(splits)}", flush=True)
+        print(f"{'='*60}", flush=True)
 
         # Fold-specific datasets
         train_dataset = DeceptionDataset(str(manifest), str(feature_dir), augment=True, n_frames=config.n_frames)
@@ -179,7 +179,7 @@ def run_cross_validation(config: ModelConfig):
         n_neg = train_labels.count(0)
         n_pos = train_labels.count(1)
         pos_weight = torch.tensor([1.0], dtype=torch.float32)  # sampler already balances classes
-        print(f"  Train: {len(train_labels)} samples | neg={n_neg} pos={n_pos} (balanced via sampler)")
+        print(f"  Train: {len(train_labels)} samples | neg={n_neg} pos={n_pos} (balanced via sampler)", flush=True)
 
         train_sampler = make_weighted_sampler(train_labels)
 
@@ -231,7 +231,7 @@ def run_cross_validation(config: ModelConfig):
         patience_counter = 0
 
         for epoch in range(config.max_epochs):
-            print(f"  Epoch {epoch+1}/{config.max_epochs}")
+            print(f"  Epoch {epoch+1}/{config.max_epochs}", flush=True)
             train_loss, train_acc = train_one_epoch(
                 model, train_loader, optimizer, scheduler,
                 pos_weight, device, config.grad_clip,
@@ -246,7 +246,8 @@ def run_cross_validation(config: ModelConfig):
                 f"train_loss={train_loss:.4f} train_acc={train_acc:.3f} | "
                 f"val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['accuracy']:.3f} "
                 f"val_f1={val_metrics['f1']:.3f} val_auc={val_metrics['auc_roc']:.3f} "
-                f"logit_μ={val_metrics['logit_mean']:+.2f} logit_σ={val_metrics['logit_std']:.2f}"
+                f"logit_μ={val_metrics['logit_mean']:+.2f} logit_σ={val_metrics['logit_std']:.2f}",
+                flush=True,
             )
 
             if val_metrics["auc_roc"] > best_val_auc:
@@ -258,11 +259,11 @@ def run_cross_validation(config: ModelConfig):
             else:
                 patience_counter += 1
                 if patience_counter >= config.patience:
-                    print(f"  Early stopping at epoch {epoch + 1}")
+                    print(f"  Early stopping at epoch {epoch + 1}", flush=True)
                     break
 
         print(f"\n  Fold {fold+1} best: auc={best_metrics.get('auc_roc', 0):.3f} "
-              f"f1={best_metrics.get('f1', 0):.3f} acc={best_metrics.get('accuracy', 0):.3f}")
+              f"f1={best_metrics.get('f1', 0):.3f} acc={best_metrics.get('accuracy', 0):.3f}", flush=True)
         fold_metrics.append(best_metrics)
 
         # Free GPU memory before the next fold's model is allocated
