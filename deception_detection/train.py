@@ -267,11 +267,11 @@ def run_cross_validation(config: ModelConfig):
 
         # Model, optimizer, scheduler, AMP scaler
         model = FusionModel(config).to(device)
-        if hasattr(torch, "compile"):
-            model = torch.compile(model)
         if torch.cuda.device_count() > 1:
             print(f"  Using {torch.cuda.device_count()} GPUs (DataParallel)", flush=True)
             model = torch.nn.DataParallel(model)
+        if hasattr(torch, "compile"):
+            model = torch.compile(model)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         n_trainable = sum(p.numel() for p in trainable_params)
         n_total = sum(p.numel() for p in model.parameters())
