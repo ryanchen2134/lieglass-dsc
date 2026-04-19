@@ -20,33 +20,38 @@ from .visual_model import ViT_Model
 
 
 class CrossFusionModule(nn.Module):
-    """
-    Gated audio-visual fusion.
-
-    Projects both embeddings to d_cross, then uses a learned gate to blend
-    them before projecting to d_out.  No batch-level operations — stable
-    with small batch sizes.
-    """
-
-    def __init__(self, d_audio: int = 768, d_visual: int = 768, d_cross: int = 256, d_out: int = 512):
+    def __init__(self, audio_dim=768, visual_dim=768, fusion_dim=512):
         super().__init__()
-        self.audio_proj  = nn.Linear(d_audio,  d_cross)
-        self.visual_proj = nn.Linear(d_visual, d_cross)
-        # Gate: takes both projections → scalar per feature
-        self.gate = nn.Linear(2 * d_cross, d_cross)
-        self.out  = nn.Linear(2 * d_cross, d_out)
+        # Project both to the same size for the gate
+        self.audio_proj = nn.Linear(audio_dim, fusion_dim)
+        self.visual_proj = nn.Linear(visual_dim, fusion_dim)
+        
+        # The Gate: Takes both modalities and outputs a score between 0 and 1
+        self.gate = nn.Sequential(
+            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.Sigmoid()
+        )
+        
+        self.output_layer = nn.Sequential(
+            nn.Linear(fusion_dim, fusion_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
 
-    def forward(self, audio: torch.Tensor, visual: torch.Tensor) -> torch.Tensor:
-        a = self.audio_proj(audio)    # (B, d_cross)
-        v = self.visual_proj(visual)  # (B, d_cross)
-
-        # Soft gate: how much audio vs visual to use per feature
-        g = torch.sigmoid(self.gate(torch.cat([a, v], dim=-1)))  # (B, d_cross)
-        a_gated = g * a
-        v_gated = (1 - g) * v
-
-        fused = torch.cat([a_gated, v_gated], dim=-1)  # (B, 2*d_cross)
-        return self.out(fused)                          # (B, d_out)
+    def forward(self, a, v):
+        # a: (B, 768), v: (B, 768)
+        a_proj = torch.tanh(self.audio_proj(a))
+        v_proj = torch.tanh(self.visual_proj(v))
+        
+        # Calculate gate weight
+        gate_input = torch.cat([a_proj, v_proj], dim=-1)
+        g = self.gate(gate_input) # Weight for audio vs visual
+        
+        # Gated fusion: g decides how much audio to keep vs visual
+        # If g is 0.8, it's 80% audio and 20% visual
+        h = g * a_proj + (1 - g) * v_proj
+        
+        return self.output_layer(h)
 
 
 class FusionModel(nn.Module):
@@ -56,10 +61,9 @@ class FusionModel(nn.Module):
         self.visual_model = ViT_Model(config)
 
         self.fusion = CrossFusionModule(
-            d_audio=config.d_audio,
-            d_visual=config.d_visual,
-            d_cross=config.d_cross,
-            d_out=config.d_fused,
+            audio_dim=config.d_audio,   # Changed from d_audio
+            visual_dim=config.d_visual, # Changed from d_visual
+            fusion_dim=config.d_fused   # Changed from d_out or whatever was there
         )
 
         self.head = nn.Sequential(
@@ -72,16 +76,8 @@ class FusionModel(nn.Module):
 
         # ImageNet normalisation constants, registered as buffers so they
         # move to the correct device with the model (incl. DataParallel replicas).
-        self.register_buffer(
-            "_img_mean",
-            torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_img_std",
-            torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1),
-            persistent=False,
-        )
+        self.register_buffer("_img_mean", torch.tensor([0.45]).view(1, 1, 1, 1, 1)) 
+        self.register_buffer("_img_std",  torch.tensor([0.22]).view(1, 1, 1, 1, 1))
 
     def forward(self, batch: dict) -> torch.Tensor:
         """
@@ -98,16 +94,28 @@ class FusionModel(nn.Module):
         waveform = batch["waveform"]
         frames   = batch["frames"]
         waveform_mask = batch.get("waveform_mask")
-        frame_mask    = batch.get("frame_mask")      # (B, N) bool or None
+        frame_mask    = batch.get("frame_mask")
 
-        # GPU-side uint8 → ImageNet-normalised float. Avoids a 4× larger
-        # CPU→GPU transfer and a costly CPU float conversion.
+        # 1. FORCE 1-CHANNEL IMMEDIATELY
+        if frames.shape[2] == 3:
+            # Slicing is better than repeating/averaging for speed
+            frames = frames[:, :, :1, :, :] 
+
+        # 2. CONVERT TO FLOAT
         if frames.dtype == torch.uint8:
-            frames = frames.float().div_(255.0).sub_(self._img_mean).div_(self._img_std)
+            frames = frames.float().div(255.0)
+            
+        # 3. NORMALIZE (using the 1-channel buffers you updated)
+        frames = (frames - self._img_mean) / self._img_std
 
-        audio_emb  = self.audio_model(waveform, waveform_mask)   # (B, 768)
-        visual_emb = self.visual_model(frames, frame_mask)        # (B, 768)
+        # 4. REMOVE THE REPEAT BLOCK
+        # Delete the lines: 
+        # if frames.shape[2] == 1: 
+        #     frames = frames.repeat(...)
 
-        fused  = self.fusion(audio_emb, visual_emb)              # (B, 512)
-        logits = self.head(fused).squeeze(-1)                    # (B,)
+        audio_emb  = self.audio_model(waveform, waveform_mask)
+        visual_emb = self.visual_model(frames, frame_mask)
+
+        fused  = self.fusion(audio_emb, visual_emb)
+        logits = self.head(fused).squeeze(-1)
         return logits

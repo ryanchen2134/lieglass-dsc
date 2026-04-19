@@ -39,6 +39,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
+from transformers import ViTModel, ViTConfig
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,7 @@ class CNN_Face(nn.Module):
     def __init__(self):
         super().__init__()
         self.stage1 = nn.Sequential(
-            _conv_block(3, 64),
+            _conv_block(1, 64),
             _conv_block(64, 64),
             nn.MaxPool2d(2),        # 224 → 112
         )
@@ -103,87 +104,54 @@ def _sinusoidal_pe(seq_len: int, d_model: int, device, dtype) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 class ViT_Model(nn.Module):
-    """
-    Name kept as ``ViT_Model`` for import compatibility; internally this is
-    now a temporal Transformer encoder, not HuggingFace ViT.
-    """
-
     def __init__(self, config):
         super().__init__()
-        self.cnn_chunk_size = config.cnn_chunk_size
-        self.d_model = config.d_visual
+        
+        # 1. Load Config and Force 1-Channel
+        v_config = ViTConfig.from_pretrained(config.vit_model)
+        v_config.num_channels = 1
+        
+        # 2. Load Pretrained ViT
+        self.vit = ViTModel.from_pretrained(
+            config.vit_model, 
+            config=v_config, 
+            ignore_mismatched_sizes=True
+        )
 
-        self.cnn  = CNN_Face()
-        self.proj = nn.Linear(256, self.d_model)
-
-        # Head count — 8 divides 768 evenly and keeps per-head dim at 96.
-        n_heads = getattr(config, "vit_n_heads", 8)
-        layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model,
-            nhead=n_heads,
-            dim_feedforward=4 * self.d_model,
-            dropout=config.dropout,
-            activation="gelu",
+        # 3. Temporal Processor (The Upgrade)
+        # We use 2 layers of Bi-directional GRU to capture complex patterns
+        self.temporal_processor = nn.GRU(
+            input_size=768,      # Standard ViT-base hidden size
+            hidden_size=384,     # 384 * 2 (bidirectional) = 768 total output
+            num_layers=2,
             batch_first=True,
-            norm_first=True,                # pre-LN = more stable training
+            bidirectional=True,
+            dropout=0.1
         )
-        self.transformer = nn.TransformerEncoder(
-            layer,
-            num_layers=config.vit_n_layers,
-            enable_nested_tensor=False,
-        )
-        self.norm = nn.LayerNorm(self.d_model)
 
-    # --------------------------------------------------------------
-    # Forward
-    # --------------------------------------------------------------
-    def forward(
-        self,
-        frames: torch.Tensor,
-        frame_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            frames:     FloatTensor (B, N, 3, 224, 224) — pre-normalised.
-            frame_mask: BoolTensor  (B, N) — True for real frames, False for
-                        padding. Padded positions are excluded from attention
-                        and from the final mean pool.
+    def forward(self, x, mask=None):
+        # x shape: (Batch, Num_Frames, 1, 224, 224)
+        batch_size, num_frames, C, H, W = x.shape
+        
+        # Flatten frames to process through ViT: (B*N, 1, 224, 224)
+        x_flat = x.view(-1, C, H, W) 
+        
+        # 1. Spatial Feature Extraction
+        outputs = self.vit(x_flat)
+        # Reshape back to (Batch, Num_Frames, 768)
+        frame_features = outputs.pooler_output.view(batch_size, num_frames, -1)
 
-        Returns:
-            FloatTensor (B, d_visual).
-        """
-        B, N, C, H, W = frames.shape
+        # 2. Temporal Feature Extraction
+        # gru_out shape: (Batch, Num_Frames, 768)
+        gru_out, _ = self.temporal_processor(frame_features)
 
-        # ---- Per-frame CNN — chunked + gradient-checkpointed during training.
-        # Rationale: 300+ frames per clip would otherwise retain huge
-        # stage-1 activations for backward. Checkpointing trades ~30% extra
-        # compute for a >10× cut in peak CNN VRAM.
-        flat = frames.view(B * N, C, H, W)
-        chunks = flat.split(self.cnn_chunk_size)
-        if self.training:
-            x = torch.cat(
-                [grad_checkpoint(self.cnn, ch, use_reentrant=False) for ch in chunks]
-            )
+        # 3. Context-Aware Pooling
+        # We average the GRU outputs. Because the GRU is bidirectional, 
+        # every frame's vector now contains info from the frames before AND after it.
+        if mask is not None:
+            valid = mask.to(gru_out.dtype).unsqueeze(-1) # (B, N, 1)
+            visual_summary = (gru_out * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
         else:
-            x = torch.cat([self.cnn(ch) for ch in chunks])           # (B*N, 256)
-        x = x.view(B, N, 256)
+            visual_summary = gru_out.mean(dim=1)
 
-        # ---- Projection + sinusoidal positional encoding.
-        x = self.proj(x)                                             # (B, N, d)
-        x = x + _sinusoidal_pe(N, self.d_model, x.device, x.dtype)
-
-        # ---- Temporal Transformer with padding mask.
-        # src_key_padding_mask: True at padded positions (PyTorch convention).
-        key_padding_mask = None
-        if frame_mask is not None:
-            key_padding_mask = ~frame_mask                           # (B, N)
-
-        x = self.transformer(x, src_key_padding_mask=key_padding_mask)
-        x = self.norm(x)                                             # (B, N, d)
-
-        # ---- Masked mean pool.
-        if frame_mask is not None:
-            valid = frame_mask.to(x.dtype).unsqueeze(-1)             # (B, N, 1)
-            n_valid = valid.sum(dim=1).clamp(min=1.0)
-            return (x * valid).sum(dim=1) / n_valid
-        return x.mean(dim=1)
+        return visual_summary # Final shape: (Batch, 768)

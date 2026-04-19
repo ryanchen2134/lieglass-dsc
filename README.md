@@ -6,10 +6,10 @@ Run:
 # From project root
 python -m deception_detection.data.preprocessing.preprocess_resized \
     --manifest Data/manifest_dolos.csv \
-    --resized_dir Data/DOLOS-all/resizedVideosNew \
+    --resized_dir Data/Resized-Grayscale-Audio \
     --feature_dir features \
     --workers 4
 
 python -m deception_detection.train \
     --manifest Data/manifest_dolos.csv \
-    --feature_dir features
+    --feature_dir features | tee output.txt
