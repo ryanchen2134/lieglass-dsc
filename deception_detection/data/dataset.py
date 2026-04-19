@@ -45,6 +45,8 @@ def _load_frames_full(
     """
     data = np.load(str(npz_path))
     frames_hwc = data["frames"]                # (N, 224, 224, 3) uint8
+    if frames_hwc.shape[-1] == 3:
+        frames_hwc = frames_hwc[..., :1]
     N = len(frames_hwc)
 
     if max_frames is not None and N > max_frames:
@@ -68,13 +70,19 @@ def _load_frames_legacy(
     """
     data = np.load(str(npz_path))
     frames_hwc = data["frames"]                # (N, H, W, 3) uint8
+    if frames_hwc.shape[-1] == 3:
+        frames_hwc = frames_hwc[..., :1]
+
     mask_all   = data["mask"]                  # (N,) bool
     N = len(frames_hwc)
     if N != n:
         idx = np.linspace(0, N - 1, n, dtype=int)
         frames_hwc = frames_hwc[idx]
         mask_all   = mask_all[idx]
-    frames_chw = np.ascontiguousarray(frames_hwc.transpose(0, 3, 1, 2))
+    if frames_hwc.ndim == 4: # (N, H, W, C)
+        frames_chw = np.ascontiguousarray(frames_hwc.transpose(0, 3, 1, 2))
+    else: # (N, H, W) -> (N, 1, H, W)
+        frames_chw = frames_hwc[:, np.newaxis, :, :]
     return torch.from_numpy(frames_chw), torch.from_numpy(mask_all.copy())
 
 
@@ -100,7 +108,7 @@ def _load_frames(
 
     # Nothing on disk — emit a single black frame so the model still runs.
     return (
-        torch.zeros(1, 3, 224, 224, dtype=torch.uint8),
+        torch.zeros(1, 1, 224, 224, dtype=torch.uint8), # 1 channel
         torch.zeros(1, dtype=torch.bool),
     )
 
@@ -136,10 +144,21 @@ class DeceptionDataset(Dataset):
         self.legacy_n_frames = legacy_n_frames
         self.samples: list[tuple[str, int]] = []
 
+        missing_count = 0
         with open(manifest_csv, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                self.samples.append((row["sample_id"], int(row["label"])))
+                sample_id = row["sample_id"]
+                # Check if the mandatory audio file exists before adding to list
+                check_path = self.feature_dir / sample_id / "audio.wav"
+                
+                if check_path.exists():
+                    self.samples.append((sample_id, int(row["label"])))
+                else:
+                    missing_count += 1
+        
+        if missing_count > 0:
+            print(f"NOTE: Skipped {missing_count} samples because audio.wav was missing in {feature_dir}")
 
     def get_labels(self) -> list[int]:
         return [label for _, label in self.samples]
@@ -168,6 +187,11 @@ class DeceptionDataset(Dataset):
             waveform = self._augment_waveform(waveform)
             # Pixel-noise augmentation runs on GPU after uint8 → float
             # normalisation (see FusionModel.forward).
+
+        if frames.shape[1] == 3:
+            # Weighted average converts (N, 3, H, W) -> (N, 1, H, W)
+            w = torch.tensor([0.2989, 0.5870, 0.1140]).view(1, 3, 1, 1)
+            frames = (frames.float() * w).sum(dim=1, keepdim=True).to(torch.uint8)
 
         return {
             "waveform":   waveform,

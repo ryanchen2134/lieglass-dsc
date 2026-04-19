@@ -19,6 +19,7 @@ class ModelConfig:
     vit_n_heads: int = 8                # multi-head attention heads
     vit_unfreeze_last_n: int = 4        # retained for compat; all temporal layers are trainable
     cnn_chunk_size: int = 32            # frames per CNN chunk (caps peak activation)
+    in_channels: int = 1
 
     # Full-frame pipeline — every frame of the clip is used. ``max_frames``
     # is a safety cap: if a clip has more frames than this, a contiguous
@@ -32,8 +33,8 @@ class ModelConfig:
     dropout: float = 0.4
 
     # --- Training ---
-    batch_size: int = 4                 # smaller default — clips are longer now
-    learning_rate: float = 1e-4
+    batch_size: int = 32                 # smaller default — clips are longer now
+    learning_rate: float = 5e-5
     weight_decay: float = 1e-2
     max_epochs: int = 200
     patience: int = 30
@@ -44,7 +45,7 @@ class ModelConfig:
 
     # --- Cross-validation ---
     n_folds: int = 8
-    seed: int = 42
+    seed: int = 2222
 
     # --- Paths ---
     feature_dir: str = "features"
