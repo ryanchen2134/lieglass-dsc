@@ -39,6 +39,8 @@ def main():
         str(root / args.manifest),
         str(root / args.feature_dir),
         augment=False,
+        max_frames=config.max_frames,
+        legacy_n_frames=config.legacy_n_frames,
     )
     loader = DataLoader(
         dataset,

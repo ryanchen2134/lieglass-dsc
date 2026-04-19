@@ -209,7 +209,12 @@ def run_cross_validation(config: ModelConfig):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Load full dataset for CV splitting
-    full_dataset = DeceptionDataset(str(manifest), str(feature_dir), augment=False, n_frames=config.n_frames)
+    full_dataset = DeceptionDataset(
+        str(manifest), str(feature_dir),
+        augment=False,
+        max_frames=config.max_frames,
+        legacy_n_frames=config.legacy_n_frames,
+    )
     labels = full_dataset.get_labels()
     indices = list(range(len(full_dataset)))
 
@@ -230,9 +235,19 @@ def run_cross_validation(config: ModelConfig):
         print(f"{'='*60}", flush=True)
 
         # Fold-specific datasets
-        train_dataset = DeceptionDataset(str(manifest), str(feature_dir), augment=True, n_frames=config.n_frames)
+        train_dataset = DeceptionDataset(
+            str(manifest), str(feature_dir),
+            augment=True,
+            max_frames=config.max_frames,
+            legacy_n_frames=config.legacy_n_frames,
+        )
         train_dataset.samples = [train_dataset.samples[i] for i in train_idx]
-        val_dataset = DeceptionDataset(str(manifest), str(feature_dir), augment=False, n_frames=config.n_frames)
+        val_dataset = DeceptionDataset(
+            str(manifest), str(feature_dir),
+            augment=False,
+            max_frames=config.max_frames,
+            legacy_n_frames=config.legacy_n_frames,
+        )
         val_dataset.samples = [val_dataset.samples[i] for i in val_idx]
 
         # Class balance info — rebalancing handled entirely by the weighted sampler
@@ -381,8 +396,8 @@ def main():
                         help="DataLoader workers (0=safe default; 4 after extract_frames.py)")
     parser.add_argument("--grad_accum", type=int, default=None,
                         help="Gradient accumulation steps (effective_batch = batch_size × steps)")
-    parser.add_argument("--n_frames", type=int, default=None,
-                        help="Frames sampled per video (default 16; use 64 for max quality)")
+    parser.add_argument("--max_frames", type=int, default=None,
+                        help="Cap on frames per clip (None = use all). Full-frame pipeline default is 400.")
     args = parser.parse_args()
 
     config = ModelConfig()
@@ -404,8 +419,8 @@ def main():
         config.num_workers = args.num_workers
     if args.grad_accum is not None:
         config.grad_accum_steps = args.grad_accum
-    if args.n_frames is not None:
-        config.n_frames = args.n_frames
+    if args.max_frames is not None:
+        config.max_frames = args.max_frames
 
     print(f"Device:          {config.device}")
     print(f"Manifest:        {config.manifest_csv}")
@@ -414,7 +429,7 @@ def main():
           f"(effective {config.batch_size * config.grad_accum_steps} "
           f"with grad_accum={config.grad_accum_steps})")
     print(f"num_workers:     {config.num_workers}")
-    print(f"n_frames:        {config.n_frames}")
+    print(f"max_frames:      {config.max_frames}")
     print(f"cnn_chunk_size:  {config.cnn_chunk_size}")
 
     run_cross_validation(config)

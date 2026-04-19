@@ -89,8 +89,8 @@ class FusionModel(nn.Module):
             batch: dict with keys:
                 waveform        FloatTensor (B, T)
                 waveform_mask   BoolTensor  (B, T)   True=valid  (optional)
-                frames          ByteTensor  (B, n_frames, 3, 224, 224)  uint8 RGB
-                frame_mask      BoolTensor  (B, n_frames)  True=speaker visible (optional)
+                frames          ByteTensor  (B, N, 3, 224, 224)  uint8 RGB (N varies per batch)
+                frame_mask      BoolTensor  (B, N)   True=real frame (False=padding, optional)
 
         Returns:
             logits FloatTensor (B,) — raw (pre-sigmoid) logits
@@ -98,7 +98,7 @@ class FusionModel(nn.Module):
         waveform = batch["waveform"]
         frames   = batch["frames"]
         waveform_mask = batch.get("waveform_mask")
-        frame_mask    = batch.get("frame_mask")      # (B, n_frames) bool or None
+        frame_mask    = batch.get("frame_mask")      # (B, N) bool or None
 
         # GPU-side uint8 → ImageNet-normalised float. Avoids a 4× larger
         # CPU→GPU transfer and a costly CPU float conversion.
