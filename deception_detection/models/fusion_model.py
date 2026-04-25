@@ -22,36 +22,32 @@ from .visual_model import ViT_Model
 class CrossFusionModule(nn.Module):
     def __init__(self, audio_dim=768, visual_dim=768, fusion_dim=512):
         super().__init__()
-        # Project both to the same size for the gate
+        # Cross-Attention: Audio queries Visual
+        self.cross_attn = nn.MultiheadAttention(embed_dim=fusion_dim, num_heads=8, batch_first=True)
+        
         self.audio_proj = nn.Linear(audio_dim, fusion_dim)
         self.visual_proj = nn.Linear(visual_dim, fusion_dim)
         
-        # The Gate: Takes both modalities and outputs a score between 0 and 1
-        self.gate = nn.Sequential(
+        # Residual fusion layer
+        self.fc_fuse = nn.Sequential(
             nn.Linear(fusion_dim * 2, fusion_dim),
-            nn.Sigmoid()
-        )
-        
-        self.output_layer = nn.Sequential(
-            nn.Linear(fusion_dim, fusion_dim),
-            nn.ReLU(),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
             nn.Dropout(0.2)
         )
 
     def forward(self, a, v):
-        # a: (B, 768), v: (B, 768)
-        a_proj = torch.tanh(self.audio_proj(a))
-        v_proj = torch.tanh(self.visual_proj(v))
+        # a, v: (B, 768) -> (B, 512)
+        a_proj = self.audio_proj(a).unsqueeze(1) # (B, 1, 512)
+        v_proj = self.visual_proj(v).unsqueeze(1) # (B, 1, 512)
         
-        # Calculate gate weight
-        gate_input = torch.cat([a_proj, v_proj], dim=-1)
-        g = self.gate(gate_input) # Weight for audio vs visual
+        # Audio "looks at" Video
+        # Query=Audio, Key=Video, Value=Video
+        attn_out, _ = self.cross_attn(query=a_proj, key=v_proj, value=v_proj)
         
-        # Gated fusion: g decides how much audio to keep vs visual
-        # If g is 0.8, it's 80% audio and 20% visual
-        h = g * a_proj + (1 - g) * v_proj
-        
-        return self.output_layer(h)
+        # Combine the original audio with the visually-informed features
+        combined = torch.cat([a_proj.squeeze(1), attn_out.squeeze(1)], dim=-1)
+        return self.fc_fuse(combined)
 
 
 class FusionModel(nn.Module):
@@ -61,61 +57,48 @@ class FusionModel(nn.Module):
         self.visual_model = ViT_Model(config)
 
         self.fusion = CrossFusionModule(
-            audio_dim=config.d_audio,   # Changed from d_audio
-            visual_dim=config.d_visual, # Changed from d_visual
-            fusion_dim=config.d_fused   # Changed from d_out or whatever was there
+            audio_dim=config.d_audio,
+            visual_dim=config.d_visual,
+            fusion_dim=config.d_fused
         )
 
+        # Deeper head for final reasoning
         self.head = nn.Sequential(
-            nn.LayerNorm(config.d_fused),
-            nn.Linear(config.d_fused, 128),
+            nn.Linear(config.d_fused, 256),
+            nn.BatchNorm1d(256),
             nn.GELU(),
             nn.Dropout(config.dropout),
-            nn.Linear(128, 1),
+            nn.Linear(256, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
         )
 
-        # ImageNet normalisation constants, registered as buffers so they
-        # move to the correct device with the model (incl. DataParallel replicas).
-        self.register_buffer("_img_mean", torch.tensor([0.45]).view(1, 1, 1, 1, 1)) 
-        self.register_buffer("_img_std",  torch.tensor([0.22]).view(1, 1, 1, 1, 1))
+        # Buffers for Grayscale (ImageNet-style mean/std for 1-channel)
+        self.register_buffer("_img_mean", torch.tensor([0.5]).view(1, 1, 1, 1, 1)) 
+        self.register_buffer("_img_std",  torch.tensor([0.25]).view(1, 1, 1, 1, 1))
 
     def forward(self, batch: dict) -> torch.Tensor:
-        """
-        Args:
-            batch: dict with keys:
-                waveform        FloatTensor (B, T)
-                waveform_mask   BoolTensor  (B, T)   True=valid  (optional)
-                frames          ByteTensor  (B, N, 3, 224, 224)  uint8 RGB (N varies per batch)
-                frame_mask      BoolTensor  (B, N)   True=real frame (False=padding, optional)
-
-        Returns:
-            logits FloatTensor (B,) — raw (pre-sigmoid) logits
-        """
         waveform = batch["waveform"]
-        frames   = batch["frames"]
+        frames   = batch["frames"] # (B, N, C, H, W)
         waveform_mask = batch.get("waveform_mask")
         frame_mask    = batch.get("frame_mask")
 
-        # 1. FORCE 1-CHANNEL IMMEDIATELY
+        # 1. Grayscale Slicing (Ensure 1-channel)
         if frames.shape[2] == 3:
-            # Slicing is better than repeating/averaging for speed
-            frames = frames[:, :, :1, :, :] 
+            # Optimal slicing: [Batch, Frames, 1, Height, Width]
+            frames = frames[:, :, 0:1, :, :] 
 
-        # 2. CONVERT TO FLOAT
+        # 2. Preprocessing
         if frames.dtype == torch.uint8:
             frames = frames.float().div(255.0)
             
-        # 3. NORMALIZE (using the 1-channel buffers you updated)
         frames = (frames - self._img_mean) / self._img_std
 
-        # 4. REMOVE THE REPEAT BLOCK
-        # Delete the lines: 
-        # if frames.shape[2] == 1: 
-        #     frames = frames.repeat(...)
-
+        # 3. Backbone Passes
         audio_emb  = self.audio_model(waveform, waveform_mask)
         visual_emb = self.visual_model(frames, frame_mask)
 
+        # 4. Fusion & Logits
         fused  = self.fusion(audio_emb, visual_emb)
         logits = self.head(fused).squeeze(-1)
         return logits

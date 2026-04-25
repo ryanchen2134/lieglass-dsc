@@ -1,0 +1,643 @@
+How would I verify that this model is actually training stuff? I'm training using the DOLOS dataset, but modified to be 256x256 in size and grayscaled, with only 1437 of the 1600+ videos that I can actually use.
+
+--------------------
+deception_detection/config.py
+--------------------
+
+from dataclasses import dataclass, field
+import torch
+
+
+@dataclass
+class ModelConfig:
+    # --- Wav2Vec2 audio encoder ---
+    wav2vec2_model: str = "facebook/wav2vec2-base"
+    d_audio: int = 768
+    wav2vec2_unfreeze_last_n: int = 0   # 0 = fully frozen; raise to fine-tune
+
+    # --- Visual encoder (CNN_Face + temporal Transformer) ---
+    # Note: ``vit_model`` is kept for backwards compatibility with serialized
+    # configs but is no longer loaded — the temporal encoder is a native
+    # ``nn.TransformerEncoder`` built from scratch (see visual_model.py).
+    vit_model: str = "google/vit-base-patch16-224"
+    d_visual: int = 768
+    vit_n_layers: int = 4               # temporal Transformer depth
+    vit_n_heads: int = 8                # multi-head attention heads
+    vit_unfreeze_last_n: int = 4        # retained for compat; all temporal layers are trainable
+    cnn_chunk_size: int = 32            # frames per CNN chunk (caps peak activation)
+    in_channels: int = 1
+
+    # Full-frame pipeline — every frame of the clip is used. ``max_frames``
+    # is a safety cap: if a clip has more frames than this, a contiguous
+    # centre window is taken. Set to ``None`` for no cap (watch VRAM).
+    max_frames: int = 128
+    legacy_n_frames: int = 16           # used only when falling back to frames.npz
+
+    # --- Cross-modal fusion ---
+    d_cross: int = 256
+    d_fused: int = 512
+    dropout: float = 0.4
+
+    # --- Training ---
+    batch_size: int = 16                 # smaller default — clips are longer now
+    learning_rate: float = 5e-5
+    weight_decay: float = 1e-2
+    max_epochs: int = 200
+    patience: int = 30
+    grad_clip: float = 1.0
+    label_smoothing: float = 0.1
+    pos_weight: float = 2.33            # placeholder; sampler balances classes
+    grad_accum_steps: int = 2           # effective_batch = batch_size × steps
+
+    # --- Cross-validation ---
+    n_folds: int = 8
+    seed: int = 2222
+
+    # --- Paths ---
+    feature_dir: str = "features"
+    manifest_csv: str = "Data/manifest_dolos.csv"
+    checkpoint_dir: str = "checkpoints"
+
+    # --- DataLoader ---
+    num_workers: int = 4
+    prefetch_factor: int = 4
+
+    # --- Device ---
+    device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
+
+
+
+
+--------------------
+deception_detection/models/fusion_model.py
+--------------------
+
+"""
+Cross-modal fusion model combining Wav2Vec2 audio and CNN+ViT visual streams.
+
+Architecture (adapted from DOLOS repo — NMS05/Audio-Visual-Deception-Detection-...):
+  audio_emb (B, 768) + visual_emb (B, 768)
+    → CrossFusionModule: project → correlation → residual concat → (B, 512)
+    → classifier head → logit (B,)
+
+Usage:
+    model = FusionModel(config)
+    logit = model(batch)   # batch["waveform"] (B,T), batch["frames"] (B,64,3,224,224)
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .audio_model import W2V2_Model
+from .visual_model import ViT_Model
+
+
+class CrossFusionModule(nn.Module):
+    def __init__(self, audio_dim=768, visual_dim=768, fusion_dim=512):
+        super().__init__()
+        # Project both to the same size for the gate
+        self.audio_proj = nn.Linear(audio_dim, fusion_dim)
+        self.visual_proj = nn.Linear(visual_dim, fusion_dim)
+        
+        # The Gate: Takes both modalities and outputs a score between 0 and 1
+        self.gate = nn.Sequential(
+            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.Sigmoid()
+        )
+        
+        self.output_layer = nn.Sequential(
+            nn.Linear(fusion_dim, fusion_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+
+    def forward(self, a, v):
+        # a: (B, 768), v: (B, 768)
+        a_proj = torch.tanh(self.audio_proj(a))
+        v_proj = torch.tanh(self.visual_proj(v))
+        
+        # Calculate gate weight
+        gate_input = torch.cat([a_proj, v_proj], dim=-1)
+        g = self.gate(gate_input) # Weight for audio vs visual
+        
+        # Gated fusion: g decides how much audio to keep vs visual
+        # If g is 0.8, it's 80% audio and 20% visual
+        h = g * a_proj + (1 - g) * v_proj
+        
+        return self.output_layer(h)
+
+
+class FusionModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.audio_model  = W2V2_Model(config)
+        self.visual_model = ViT_Model(config)
+
+        self.fusion = CrossFusionModule(
+            audio_dim=config.d_audio,   # Changed from d_audio
+            visual_dim=config.d_visual, # Changed from d_visual
+            fusion_dim=config.d_fused   # Changed from d_out or whatever was there
+        )
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(config.d_fused),
+            nn.Linear(config.d_fused, 128),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(128, 1),
+        )
+
+        # ImageNet normalisation constants, registered as buffers so they
+        # move to the correct device with the model (incl. DataParallel replicas).
+        self.register_buffer("_img_mean", torch.tensor([0.45]).view(1, 1, 1, 1, 1)) 
+        self.register_buffer("_img_std",  torch.tensor([0.22]).view(1, 1, 1, 1, 1))
+
+    def forward(self, batch: dict) -> torch.Tensor:
+        """
+        Args:
+            batch: dict with keys:
+                waveform        FloatTensor (B, T)
+                waveform_mask   BoolTensor  (B, T)   True=valid  (optional)
+                frames          ByteTensor  (B, N, 3, 224, 224)  uint8 RGB (N varies per batch)
+                frame_mask      BoolTensor  (B, N)   True=real frame (False=padding, optional)
+
+        Returns:
+            logits FloatTensor (B,) — raw (pre-sigmoid) logits
+        """
+        waveform = batch["waveform"]
+        frames   = batch["frames"]
+        waveform_mask = batch.get("waveform_mask")
+        frame_mask    = batch.get("frame_mask")
+
+        # 1. FORCE 1-CHANNEL IMMEDIATELY
+        if frames.shape[2] == 3:
+            # Slicing is better than repeating/averaging for speed
+            frames = frames[:, :, :1, :, :] 
+
+        # 2. CONVERT TO FLOAT
+        if frames.dtype == torch.uint8:
+            frames = frames.float().div(255.0)
+            
+        # 3. NORMALIZE (using the 1-channel buffers you updated)
+        frames = (frames - self._img_mean) / self._img_std
+
+        # 4. REMOVE THE REPEAT BLOCK
+        # Delete the lines: 
+        # if frames.shape[2] == 1: 
+        #     frames = frames.repeat(...)
+
+        audio_emb  = self.audio_model(waveform, waveform_mask)
+        visual_emb = self.visual_model(frames, frame_mask)
+
+        fused  = self.fusion(audio_emb, visual_emb)
+        logits = self.head(fused).squeeze(-1)
+        return logits
+
+
+
+--------------------
+deception_detection/models/visual_model.py
+--------------------
+
+"""
+CNN + temporal-transformer visual encoder (variable-length, full-frame pipeline).
+
+Pipeline:
+  face frames (B, N, 3, 224, 224)    — N varies per batch
+    → CNN_Face per frame                          → (B*N, 256)
+    → Linear(256 → d_visual)
+    → sinusoidal positional encoding              (arbitrary length)
+    → temporal Transformer encoder                ``vit_n_layers`` layers
+         (self-attention padding mask from ``frame_mask``)
+    → LayerNorm
+    → masked mean pool over valid frames          → (B, d_visual)
+
+Design notes
+------------
+
+The original DOLOS model stacked a fixed-N (=64) token sequence through the
+last 4 layers of ViT-B/16 with a *learnable* positional embedding. That is
+incompatible with variable-length inputs (the new full-frame pipeline keeps
+every frame, so N varies per clip), and ViT-B/16's patch-level pretraining
+transfers poorly to temporal token ordering anyway.
+
+We instead use a native ``nn.TransformerEncoder`` on top of the same CNN_Face
+trunk:
+
+  * **Variable length** — sinusoidal positional encoding extends to any N;
+    attention masks exclude padded frames.
+  * **Faster** — PyTorch's FlashAttention kernels are used automatically;
+    no HuggingFace wrapper and no frozen pretrained parameters sitting in
+    VRAM unused.
+  * **Same encoder *type*** — a multi-head self-attention Transformer over
+    projected CNN tokens, matching the DOLOS design at the layer level.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
+from transformers import ViTModel, ViTConfig
+
+
+# ---------------------------------------------------------------------------
+# Per-frame CNN
+# ---------------------------------------------------------------------------
+
+def _conv_block(in_c: int, out_c: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False),
+        nn.BatchNorm2d(out_c),
+        nn.ReLU(inplace=True),
+    )
+
+
+class CNN_Face(nn.Module):
+    """3-stage CNN (64/128/256) → 256-D global feature per frame."""
+
+    def __init__(self):
+        super().__init__()
+        self.stage1 = nn.Sequential(
+            _conv_block(1, 64),
+            _conv_block(64, 64),
+            nn.MaxPool2d(2),        # 224 → 112
+        )
+        self.stage2 = nn.Sequential(
+            _conv_block(64, 128),
+            _conv_block(128, 128),
+            nn.MaxPool2d(2),        # 112 → 56
+        )
+        self.stage3 = nn.Sequential(
+            _conv_block(128, 256),
+            _conv_block(256, 256),
+            nn.AdaptiveAvgPool2d(1),  # → (256, 1, 1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        return x.view(x.size(0), -1)
+
+
+# ---------------------------------------------------------------------------
+# Positional encoding
+# ---------------------------------------------------------------------------
+
+def _sinusoidal_pe(seq_len: int, d_model: int, device, dtype) -> torch.Tensor:
+    """(1, seq_len, d_model) sinusoidal PE — supports arbitrary length."""
+    pos = torch.arange(seq_len, device=device, dtype=torch.float32).unsqueeze(1)
+    div = torch.exp(
+        torch.arange(0, d_model, 2, device=device, dtype=torch.float32)
+        * -(math.log(10000.0) / d_model)
+    )
+    pe = torch.zeros(seq_len, d_model, device=device, dtype=torch.float32)
+    pe[:, 0::2] = torch.sin(pos * div)
+    pe[:, 1::2] = torch.cos(pos * div)
+    return pe.unsqueeze(0).to(dtype)
+
+
+# ---------------------------------------------------------------------------
+# Visual model
+# ---------------------------------------------------------------------------
+
+class ViT_Model(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        
+        # 1. Load Config and Force 1-Channel
+        v_config = ViTConfig.from_pretrained(config.vit_model)
+        v_config.num_channels = 1
+        
+        # 2. Load Pretrained ViT
+        self.vit = ViTModel.from_pretrained(
+            config.vit_model, 
+            config=v_config, 
+            ignore_mismatched_sizes=True
+        )
+
+        # 3. Temporal Processor (The Upgrade)
+        # We use 2 layers of Bi-directional GRU to capture complex patterns
+        self.temporal_processor = nn.GRU(
+            input_size=768,      # Standard ViT-base hidden size
+            hidden_size=384,     # 384 * 2 (bidirectional) = 768 total output
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.1
+        )
+
+    def forward(self, x, mask=None):
+        # x shape: (Batch, Num_Frames, 1, 224, 224)
+        batch_size, num_frames, C, H, W = x.shape
+        
+        # Flatten frames to process through ViT: (B*N, 1, 224, 224)
+        x_flat = x.view(-1, C, H, W) 
+        
+        # 1. Spatial Feature Extraction
+        outputs = self.vit(x_flat)
+        # Reshape back to (Batch, Num_Frames, 768)
+        frame_features = outputs.pooler_output.view(batch_size, num_frames, -1)
+
+        # 2. Temporal Feature Extraction
+        # gru_out shape: (Batch, Num_Frames, 768)
+        gru_out, _ = self.temporal_processor(frame_features)
+
+        # 3. Context-Aware Pooling
+        # We average the GRU outputs. Because the GRU is bidirectional, 
+        # every frame's vector now contains info from the frames before AND after it.
+        if mask is not None:
+            valid = mask.to(gru_out.dtype).unsqueeze(-1) # (B, N, 1)
+            visual_summary = (gru_out * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+        else:
+            visual_summary = gru_out.mean(dim=1)
+
+        return visual_summary # Final shape: (Batch, 768)
+
+
+
+--------------------
+deception_detection/models/audio_model.py
+--------------------
+
+"""
+Wav2Vec2-based audio encoder for deception detection.
+
+Architecture (adapted from DOLOS repo — NMS05/Audio-Visual-Deception-Detection-...):
+  raw waveform (B, T)
+    → Wav2Vec2Base CNN feature extractor  [frozen]
+    → feature projection + layer norm
+    → Wav2Vec2 transformer encoder        [last wav2vec2_unfreeze_last_n layers trainable]
+    → mean temporal pool
+    → audio embedding (B, 768)
+"""
+
+import torch
+import torch.nn as nn
+from transformers import Wav2Vec2Model
+
+
+class W2V2_Model(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.w2v2 = Wav2Vec2Model.from_pretrained(config.wav2vec2_model)
+
+        # Freeze CNN feature extractor + feature projection always
+        for p in self.w2v2.feature_extractor.parameters():
+            p.requires_grad = False
+        for p in self.w2v2.feature_projection.parameters():
+            p.requires_grad = False
+
+        # Freeze transformer layers except the last N
+        n_total = len(self.w2v2.encoder.layers)
+        n_freeze = max(0, n_total - config.wav2vec2_unfreeze_last_n)
+        for i, layer in enumerate(self.w2v2.encoder.layers):
+            if i < n_freeze:
+                for p in layer.parameters():
+                    p.requires_grad = False
+
+    def forward(self, waveform: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+            waveform:       FloatTensor (B, T) — raw 16 kHz waveform
+            attention_mask: BoolTensor  (B, T) — True = valid, False = padding (optional)
+
+        Returns:
+            FloatTensor (B, 768) — mean-pooled audio embedding
+        """
+        # Wav2Vec2 expects attention_mask as LongTensor with 1=valid, 0=pad
+        mask = None
+        if attention_mask is not None:
+            mask = attention_mask.long()
+
+        outputs = self.w2v2(input_values=waveform, attention_mask=mask)
+        hidden = outputs.last_hidden_state  # (B, T', 768)
+
+        if mask is not None:
+            # Compute frame-level mask: Wav2Vec2 downsamples T by ~320
+            # Use the model's built-in masking via output_lengths if available,
+            # otherwise fall back to simple mean pool (padding frames near zero anyway)
+            pass
+
+        return hidden.mean(dim=1)  # (B, 768)
+
+
+
+
+--------------------
+deception_detection/data/dataset.py
+--------------------
+
+"""
+Dataset for the bimodal deception detection model.
+
+Two frame sources are supported, in priority order:
+
+  1. ``frames_full.npz`` — written by ``preprocess_fullframe.py``. Holds
+     EVERY frame of the clip (variable N), uint8 RGB, already face-centred
+     with a 3× YOLO box. No frame_mask — nothing is blacked out.
+
+  2. ``frames.npz`` — legacy uniform-sampled archive (fixed N). Kept so old
+     feature caches remain usable; we return the stored mask alongside.
+
+Both sources are fork-safe (pure NumPy) so ``num_workers > 0`` is always safe.
+"""
+
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+
+import numpy as np
+import torch
+import torchaudio
+from torch.utils.data import Dataset
+
+
+# ---------------------------------------------------------------------------
+# Frame loaders
+# ---------------------------------------------------------------------------
+
+def _load_frames_full(
+    npz_path: Path,
+    max_frames: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Load ALL frames from ``frames_full.npz``.
+
+    Returns:
+        frames     ByteTensor (N, 3, 224, 224)  uint8 RGB
+        frame_mask BoolTensor (N,)              all True (no blacked frames)
+
+    When ``max_frames`` is set and the clip is longer, we take a contiguous
+    centre window. The task brief says "use all frames", so we only trim
+    when forced by the VRAM cap.
+    """
+    data = np.load(str(npz_path))
+    frames_hwc = data["frames"]                # (N, 224, 224, 3) uint8
+    if frames_hwc.shape[-1] == 3:
+        frames_hwc = frames_hwc[..., :1]
+    N = len(frames_hwc)
+
+    if max_frames is not None and N > max_frames:
+        # Centre crop along the temporal axis — preserves continuity.
+        start = (N - max_frames) // 2
+        frames_hwc = frames_hwc[start:start + max_frames]
+        N = max_frames
+
+    frames_chw = np.ascontiguousarray(frames_hwc.transpose(0, 3, 1, 2))
+    return torch.from_numpy(frames_chw), torch.ones(N, dtype=torch.bool)
+
+
+def _load_frames_legacy(
+    npz_path: Path,
+    n: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Load the legacy fixed-N archive (``frames.npz``) used by the old
+    uniform-sampling pipeline. Resamples to ``n`` if the archive has a
+    different count.
+    """
+    data = np.load(str(npz_path))
+    frames_hwc = data["frames"]                # (N, H, W, 3) uint8
+    if frames_hwc.shape[-1] == 3:
+        frames_hwc = frames_hwc[..., :1]
+
+    mask_all   = data["mask"]                  # (N,) bool
+    N = len(frames_hwc)
+    if N != n:
+        idx = np.linspace(0, N - 1, n, dtype=int)
+        frames_hwc = frames_hwc[idx]
+        mask_all   = mask_all[idx]
+    if frames_hwc.ndim == 4: # (N, H, W, C)
+        frames_chw = np.ascontiguousarray(frames_hwc.transpose(0, 3, 1, 2))
+    else: # (N, H, W) -> (N, 1, H, W)
+        frames_chw = frames_hwc[:, np.newaxis, :, :]
+    return torch.from_numpy(frames_chw), torch.from_numpy(mask_all.copy())
+
+
+def _load_frames(
+    feat_path: Path,
+    max_frames: int | None,
+    legacy_n: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pick the best frame source available for one sample."""
+    full = feat_path / "frames_full.npz"
+    if full.exists():
+        try:
+            return _load_frames_full(full, max_frames)
+        except (EOFError, ValueError, KeyError):
+            pass  # fall through to legacy / zeros
+
+    legacy = feat_path / "frames.npz"
+    if legacy.exists():
+        try:
+            return _load_frames_legacy(legacy, legacy_n)
+        except (EOFError, ValueError, KeyError):
+            pass
+
+    # Nothing on disk — emit a single black frame so the model still runs.
+    return (
+        torch.zeros(1, 1, 224, 224, dtype=torch.uint8), # 1 channel
+        torch.zeros(1, dtype=torch.bool),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class DeceptionDataset(Dataset):
+    """
+    Returns a dict per item:
+        waveform    FloatTensor (T,)
+        frames      ByteTensor  (N, 3, 224, 224)   — variable N
+        frame_mask  BoolTensor  (N,)
+        label       FloatTensor scalar
+        sample_id   str
+
+    Frames are uint8; GPU-side normalisation in ``FusionModel.forward`` keeps
+    the CPU→GPU transfer 4× smaller than pre-normalised float32.
+    """
+
+    def __init__(
+        self,
+        manifest_csv: str,
+        feature_dir: str,
+        augment: bool = False,
+        max_frames: int | None = 400,
+        legacy_n_frames: int = 16,
+    ):
+        self.feature_dir     = Path(feature_dir)
+        self.augment         = augment
+        self.max_frames      = max_frames
+        self.legacy_n_frames = legacy_n_frames
+        self.samples: list[tuple[str, int]] = []
+
+        missing_count = 0
+        with open(manifest_csv, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                sample_id = row["sample_id"]
+                # Check if the mandatory audio file exists before adding to list
+                check_path = self.feature_dir / sample_id / "audio.wav"
+                
+                if check_path.exists():
+                    self.samples.append((sample_id, int(row["label"])))
+                else:
+                    missing_count += 1
+        
+        if missing_count > 0:
+            print(f"NOTE: Skipped {missing_count} samples because audio.wav was missing in {feature_dir}")
+
+    def get_labels(self) -> list[int]:
+        return [label for _, label in self.samples]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict:
+        sample_id, label = self.samples[idx]
+        feat_path = self.feature_dir / sample_id
+
+        # --- Audio ---
+        waveform, sr = torchaudio.load(feat_path / "audio.wav")
+        if sr != 16000:
+            waveform = torchaudio.functional.resample(waveform, sr, 16000)
+        waveform = waveform.squeeze(0)  # (T,)
+
+        # --- Frames ---
+        frames, frame_mask = _load_frames(
+            feat_path,
+            max_frames=self.max_frames,
+            legacy_n=self.legacy_n_frames,
+        )
+
+        if self.augment:
+            waveform = self._augment_waveform(waveform)
+            # Pixel-noise augmentation runs on GPU after uint8 → float
+            # normalisation (see FusionModel.forward).
+
+        if frames.shape[1] == 3:
+            # Weighted average converts (N, 3, H, W) -> (N, 1, H, W)
+            w = torch.tensor([0.2989, 0.5870, 0.1140]).view(1, 3, 1, 1)
+            frames = (frames.float() * w).sum(dim=1, keepdim=True).to(torch.uint8)
+
+        return {
+            "waveform":   waveform,
+            "frames":     frames,
+            "frame_mask": frame_mask,
+            "label":      torch.tensor(label, dtype=torch.float32),
+            "sample_id":  sample_id,
+        }
+
+    @staticmethod
+    def _augment_waveform(waveform: torch.Tensor) -> torch.Tensor:
+        sigma = torch.empty(1).uniform_(0.0, 0.005).item()
+        return waveform + torch.randn_like(waveform) * sigma
+
+

@@ -10,6 +10,13 @@ python -m deception_detection.data.preprocessing.preprocess_resized \
     --feature_dir features \
     --workers 4
 
+conda activate LieGlass
+cd Shared/
+cd Shared\ Vault/
+cd Projects/
+cd Dammit/
+cd lieglass-dsc/
+
 python -m deception_detection.train \
     --manifest Data/manifest_dolos.csv \
     --feature_dir features | tee output.txt

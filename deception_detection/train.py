@@ -104,13 +104,19 @@ def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device,
     all_preds  = []
     all_labels = []
 
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
     for step, batch in enumerate(loader):
+
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
-        print(f"\r[{step + 1} / {len(loader)}] Working...", end="")
+        f_tensor = batch["frames"]
+        print(f"\r[{step + 1} / {len(loader)}] [{f_tensor.max().item():.2f}] Working...", end="", flush=True)
+        
+        #if f_tensor.std() < 0.1:
+        #    print("  WARNING: Low variance in frames. Data might be corrupted or loading incorrectly.")
+        
 
         with torch.autocast(device_type=device_str, enabled=use_amp):
             logits = model(batch)   # (B,)
@@ -143,7 +149,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device,
             else:
                 optimizer.step()
             scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none = True)
 
         # Track unscaled loss (multiply back)
         total_loss += loss.item() * grad_accum_steps * logits.size(0)
@@ -153,10 +159,16 @@ def train_one_epoch(model, loader, optimizer, scheduler, pos_weight, device,
 
     avg_loss = total_loss / max(len(all_labels), 1)
     acc = accuracy_score(all_labels, [1 if p > 0.5 else 0 for p in all_preds])
+
+    # At the very end of train_one_epoch and evaluate
+    #del all_preds, all_labels
+    import gc
+    gc.collect()
+    
     return avg_loss, acc
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate(model, loader, pos_weight, device):
     model.eval()
     total_loss = 0.0
@@ -192,6 +204,11 @@ def evaluate(model, loader, pos_weight, device):
         f1 = f1_score(all_labels, binary_preds, zero_division=0)
     except Exception:
         f1 = 0.0
+
+    # At the very end of train_one_epoch and evaluate
+    #del all_preds, all_labels
+    import gc
+    gc.collect()
 
     return {
         "loss": avg_loss,
@@ -238,20 +255,31 @@ def run_cross_validation(config: ModelConfig):
         print(f"{'='*60}", flush=True)
 
         # Fold-specific datasets
-        train_dataset = DeceptionDataset(
+        full_dataset = DeceptionDataset(
             str(manifest), str(feature_dir),
             augment=True,
             max_frames=config.max_frames,
             legacy_n_frames=config.legacy_n_frames,
         )
-        train_dataset.samples = [train_dataset.samples[i] for i in train_idx]
-        val_dataset = DeceptionDataset(
-            str(manifest), str(feature_dir),
-            augment=False,
-            max_frames=config.max_frames,
-            legacy_n_frames=config.legacy_n_frames,
-        )
-        val_dataset.samples = [val_dataset.samples[i] for i in val_idx]
+
+        train_dataset = torch.utils.data.Subset(full_dataset, train_idx)
+        val_dataset = torch.utils.data.Subset(full_dataset, val_idx)
+
+
+        # train_dataset = DeceptionDataset(
+        #     str(manifest), str(feature_dir),
+        #     augment=True,
+        #     max_frames=config.max_frames,
+        #     legacy_n_frames=config.legacy_n_frames,
+        # )
+        # train_dataset.samples = [train_dataset.samples[i] for i in train_idx]
+        # val_dataset = DeceptionDataset(
+        #     str(manifest), str(feature_dir),
+        #     augment=False,
+        #     max_frames=config.max_frames,
+        #     legacy_n_frames=config.legacy_n_frames,
+        # )
+        # val_dataset.samples = [val_dataset.samples[i] for i in val_idx]
 
         # Class balance info — rebalancing handled entirely by the weighted sampler
         train_labels = [labels[i] for i in train_idx]
@@ -271,7 +299,7 @@ def run_cross_validation(config: ModelConfig):
             sampler=train_sampler,
             collate_fn=collate_fn,
             num_workers=config.num_workers,
-            pin_memory=pin,
+            pin_memory=False,
             persistent_workers=config.num_workers > 0,
             drop_last=True,
             **extra,
@@ -282,7 +310,7 @@ def run_cross_validation(config: ModelConfig):
             shuffle=False,
             collate_fn=collate_fn,
             num_workers=config.num_workers,
-            pin_memory=pin,
+            pin_memory=False,
             persistent_workers=config.num_workers > 0,
             **extra,
         )

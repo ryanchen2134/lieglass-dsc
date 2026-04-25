@@ -126,7 +126,7 @@ def main():
 
     for row in rows:
         sid = row["sample_id"]
-        src = resized_dir / f"[R] {sid}.mp4"
+        src = resized_dir / f"{sid}.mp4"
         if not src.exists():
             missing.append(sid)
             continue
