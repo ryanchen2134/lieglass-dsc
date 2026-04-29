@@ -21,7 +21,7 @@ Lieglass is an AR glasses system designed for investigators and reporters that m
 
 ## Project Poster
 <p align="center">
-  <img src="assets/lieglassposter.png" alt="Lie Glass Poster" width="700"/>
+  <img src="assets/lieglassposter.png" alt="Lie Glass Poster" width="400"/>
 </p>
 
 # lieglass-dsc
