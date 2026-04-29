@@ -1,3 +1,17 @@
+# Lieglass
+
+What if the truth was always visible, and we just never had the right lens? 
+
+LieGlass is a pair of AR frames built for investigators and reporters who need more than instinct alone, routing live audio and video from XReal One glasses and XReal Eye through a multimodal vision-language model that derives a continuous lie score and surfaces smart prompts directly into the user's field of view. The model is trained and validated on real-world courtroom trial recordings and the DOLOS dataset, grounding its outputs in environments that reflect how reporters and investigators actually work.
+
+Everyone has a tell. Now we have the tools to find it. 🕵️
+
+## Built by: 
+**Operation Lead**, Ryan Chen 
+**Intelligence Agent**, Brian Jin
+**The Whisperer**, Ella Kim
+**Systems Operative**, Max Pinderski
+
 # lieglass-dsc
 
 All mp4 files are LFS pointers. Make sure to have Git LFS setup correctly before cloning or pulling.
