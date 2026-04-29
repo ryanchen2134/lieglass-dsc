@@ -7,10 +7,14 @@ LieGlass is a pair of AR frames built for investigators and reporters who need m
 Everyone has a tell. Now we have the tools to find it. 🕵️
 
 ## Built by: 
-**Operation Lead**, Ryan Chen 
+**Operation Lead**, Ryan Chen
+
 **Intelligence Agent**, Brian Jin
+
 **The Whisperer**, Ella Kim
+
 **Systems Operative**, Max Pinderski
+
 
 # lieglass-dsc
 
