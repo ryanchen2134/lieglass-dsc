@@ -23,7 +23,7 @@ class ModelConfig:
     d_visual: int = 768
     vit_n_layers: int = 4               # temporal Transformer depth
     vit_n_heads: int = 8                # multi-head attention heads
-    vit_unfreeze_last_n: int = 3        # retained for compat; all temporal layers are trainable
+    vit_unfreeze_last_n: int = 0        # retained for compat; all temporal layers are trainable
     cnn_chunk_size: int = 32            # frames per CNN chunk (caps peak activation)
     in_channels: int = 1
 
@@ -66,12 +66,12 @@ class ModelConfig:
 
     # --- Paths ---
     feature_dir: str = "features"
-    manifest_csv: str = "Data/manifest_dolos.csv"
+    manifest_csv: str = "Data/mixed_manifest.csv"
     checkpoint_dir: str = "checkpoints"
 
     # --- DataLoader ---
-    num_workers: int = 2
-    prefetch_factor: int = 1
+    num_workers: int = 8
+    prefetch_factor: int = 8
 
     # --- Device ---
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
