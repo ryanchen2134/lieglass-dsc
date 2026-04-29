@@ -1,19 +1,7 @@
-# Lieglass
+## LieGlass
+> *Ryan Chen, Brian Jin, Ella Kim & Max Pinderski*
 
-What if the truth was always visible, and we just never had the right lens? 
-
-LieGlass is a pair of AR frames built for investigators and reporters who need more than instinct alone, routing live audio and video from XReal One glasses and XReal Eye through a multimodal vision-language model that derives a continuous lie score and surfaces smart prompts directly into the user's field of view. The model is trained and validated on real-world courtroom trial recordings and the DOLOS dataset, grounding its outputs in environments that reflect how reporters and investigators actually work.
-
-Everyone has a tell. Now we have the tools to find it. 🕵️
-
-## Built by: 
-**Operation Lead**, Ryan Chen
-
-**Intelligence Agent**, Brian Jin
-
-**The Whisperer**, Ella Kim
-
-**Systems Operative**, Max Pinderski
+Lieglass is an AR glasses system designed for investigators and reporters that monitors real-time audio and visual cues to generate a live truth score displayed directly in the user's field of view. The system runs two parallel pipelines: a multimodal deception classifier (combining YOLOv8 face detection, a CNN+ViT visual encoder, and a Wav2Vec 2.0 audio transformer with cross-modal fusion) alongside an LLM-based semantic analysis pipeline that uses OpenAI Whisper for transcription and Claude for detecting inconsistencies in speech content. The hardware platform is the XREAL One AR frame, with the backend built on FastAPI. Trained and evaluated on the DOLOS dataset and real-life trial footage, the model achieves 88.7% accuracy, an AUC of 0.95, and an F1 of 0.88, well above the 54% human baseline.
 
 ## Model Architecture
 <p align="center">
