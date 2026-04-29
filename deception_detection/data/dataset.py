@@ -24,6 +24,24 @@ import torchaudio
 from torch.utils.data import Dataset
 
 
+def _load_audio(path: Path) -> tuple[torch.Tensor, int]:
+    """Load a WAV via torchaudio (torchcodec backend), falling back to
+    soundfile if the primary backend raises (e.g. torchcodec missing or
+    incompatible FFmpeg). Returns (waveform[channels, time], sample_rate)."""
+    try:
+        return torchaudio.load(str(path))
+    except Exception as e:
+        try:
+            import soundfile as sf
+        except ImportError as imp_err:
+            raise RuntimeError(
+                f"torchaudio.load failed for {path} ({e}); install `soundfile` to enable fallback"
+            ) from imp_err
+        data, sr = sf.read(str(path), always_2d=True)  # (T, C)
+        waveform = torch.from_numpy(data.T).float()    # (C, T)
+        return waveform, sr
+
+
 # ---------------------------------------------------------------------------
 # Frame loaders
 # ---------------------------------------------------------------------------
@@ -171,7 +189,7 @@ class DeceptionDataset(Dataset):
         feat_path = self.feature_dir / sample_id
 
         # --- Audio ---
-        waveform, sr = torchaudio.load(feat_path / "audio.wav")
+        waveform, sr = _load_audio(feat_path / "audio.wav")
         if sr != 16000:
             waveform = torchaudio.functional.resample(waveform, sr, 16000)
         waveform = waveform.squeeze(0)  # (T,)
