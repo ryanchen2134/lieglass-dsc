@@ -31,6 +31,11 @@ Everyone has a tell. Now we have the tools to find it. 🕵️
   </em>
 </p>
 
+## Project Poster
+<p align="center">
+  <img src="assets/lieglassposter.png" alt="Lie Glass Poster" width="700"/>
+</p>
+
 # lieglass-dsc
 
 All mp4 files are LFS pointers. Make sure to have Git LFS setup correctly before cloning or pulling.
