@@ -45,6 +45,6 @@ for file in files:
     content = get_python_file_content(file)
     mainstr += f"\n\n--------------------\n{file}\n--------------------\n\n{content}\n\n"
 
-with open('code.txt', 'w') as file:
+with open('code.txt', 'w', encoding='utf-8') as file:
     file.write(mainstr)
 

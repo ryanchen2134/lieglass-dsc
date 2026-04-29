@@ -17,7 +17,7 @@ class ModelConfig:
     d_visual: int = 768
     vit_n_layers: int = 4               # temporal Transformer depth
     vit_n_heads: int = 8                # multi-head attention heads
-    vit_unfreeze_last_n: int = 4        # retained for compat; all temporal layers are trainable
+    vit_unfreeze_last_n: int = 3        # retained for compat; all temporal layers are trainable
     cnn_chunk_size: int = 32            # frames per CNN chunk (caps peak activation)
     in_channels: int = 1
 
@@ -34,9 +34,9 @@ class ModelConfig:
 
     # --- Training ---
     batch_size: int = 8                 # smaller default — clips are longer now
-    learning_rate: float = 5e-6
-    weight_decay: float = 0.25
-    max_epochs: int = 100
+    learning_rate: float = 4e-5
+    weight_decay: float = 0.20
+    max_epochs: int = 60
     patience: int = 8
     grad_clip: float = 1.0
     label_smoothing: float = 0.1
@@ -44,8 +44,8 @@ class ModelConfig:
     grad_accum_steps: int = 8           # effective_batch = batch_size × steps
 
     # --- Cross-validation ---
-    n_folds: int = 8
-    seed: int = 2222
+    n_folds: int = 5
+    seed: int = 1919
 
     # --- Paths ---
     feature_dir: str = "features"

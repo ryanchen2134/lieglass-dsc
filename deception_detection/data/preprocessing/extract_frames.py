@@ -30,7 +30,7 @@ import cv2
 from pathlib import Path
 from tqdm import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(os.getcwd())
 BLACK_THRESHOLD = 8   # mean pixel value below this → black frame
 
 
@@ -123,6 +123,15 @@ def main():
             return
 
     pending, skipped, missing = [], 0, []
+
+    if not resized_dir.exists():
+        print(f"FATAL: The directory {resized_dir} does not exist!")
+        return
+    
+    actual_files = set(os.listdir(resized_dir))
+    print(f"DEBUG: Found {len(actual_files)} files in resized_dir.")
+    if len(actual_files) > 0:
+        print(f"DEBUG: Sample file in folder: {list(actual_files)[0]}")
 
     for row in rows:
         sid = row["sample_id"]

@@ -21,8 +21,8 @@ class ModelConfig:
     # ``nn.TransformerEncoder`` built from scratch (see visual_model.py).
     vit_model: str = "google/vit-base-patch16-224"
     d_visual: int = 768
-    vit_n_layers: int = 1               # temporal Transformer depth
-    vit_n_heads: int = 4                # multi-head attention heads
+    vit_n_layers: int = 4               # temporal Transformer depth
+    vit_n_heads: int = 8                # multi-head attention heads
     vit_unfreeze_last_n: int = 4        # retained for compat; all temporal layers are trainable
     cnn_chunk_size: int = 32            # frames per CNN chunk (caps peak activation)
     in_channels: int = 1
@@ -39,15 +39,15 @@ class ModelConfig:
     dropout: float = 0.6
 
     # --- Training ---
-    batch_size: int = 32                 # smaller default — clips are longer now
-    learning_rate: float = 1e-5
-    weight_decay: float = 0.15
+    batch_size: int = 8                 # smaller default — clips are longer now
+    learning_rate: float = 5e-6
+    weight_decay: float = 0.25
     max_epochs: int = 100
-    patience: int = 10
+    patience: int = 8
     grad_clip: float = 1.0
     label_smoothing: float = 0.1
     pos_weight: float = 2.33            # placeholder; sampler balances classes
-    grad_accum_steps: int = 1           # effective_batch = batch_size × steps
+    grad_accum_steps: int = 8           # effective_batch = batch_size × steps
 
     # --- Cross-validation ---
     n_folds: int = 8
@@ -60,7 +60,7 @@ class ModelConfig:
 
     # --- DataLoader ---
     num_workers: int = 2
-    prefetch_factor: int = 2
+    prefetch_factor: int = 1
 
     # --- Device ---
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
@@ -224,7 +224,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as grad_checkpoint
+from torch.utils.checkpoint import checkpoint as checkpoint
 from transformers import ViTModel, ViTConfig
 
 
@@ -360,23 +360,29 @@ class ViT_Model(nn.Module): # Rename this to VisualModel eventually
 
     def forward(self, x, mask=None):
         B, N, C, H, W = x.shape
-        # Process frames in small chunks to save VRAM
-        chunk_size = 16 # Adjust this based on memory
+        chunk_size = 16 
         all_features = []
         
         for i in range(0, N, chunk_size):
             chunk = x[:, i : i + chunk_size].reshape(-1, C, H, W)
-            # Use gradient checkpointing if memory is still tight
-            f = self.spatial_encoder(chunk)
+            
+            # REPLACEMENT: Wrap the CNN in checkpoint
+            # This deletes intermediate activations and recalculates them on backward pass
+            f = checkpoint(
+                self.spatial_encoder, 
+                chunk, 
+                use_reentrant=False
+            )
+            
             all_features.append(f.view(B, -1, f.shape[-1]))
             
-        features = torch.cat(all_features, dim=1) # (B, N, d_visual)
+        features = torch.cat(all_features, dim=1)
         
         # Temporal processing
         features = features + self.pos_embedding[:, :N, :]
         out = self.temporal_transformer(features, src_key_padding_mask=~mask if mask is not None else None)
         
-        return out.mean(dim=1) # Global average pool
+        return out.mean(dim=1)
 
 
 

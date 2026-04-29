@@ -33,7 +33,7 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(os.getcwd())
 
 # A frame is considered "black" if its mean pixel value (0-255) is below this.
 BLACK_THRESHOLD = 8
