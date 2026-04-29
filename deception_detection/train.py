@@ -644,6 +644,10 @@ def main():
     parser.add_argument("--vit_n_layers", type=int, default=None)
     parser.add_argument("--vit_n_heads", type=int, default=None)
     parser.add_argument("--freeze_visual_backbone", type=lambda v: v.lower() in ("1","true","yes","y","t"), default=None)
+    parser.add_argument("--visual_backbone", default=None, choices=["clip", "arcface"],
+                        help="Pretrained visual backbone (frozen).")
+    parser.add_argument("--visual_backbone_model", default=None,
+                        help="HuggingFace model id for --visual_backbone=clip (e.g. openai/clip-vit-large-patch14).")
     args = parser.parse_args()
 
     # Build config: JSON file (if any) -> CLI overrides.
@@ -685,6 +689,8 @@ def main():
         "vit_n_layers": args.vit_n_layers,
         "vit_n_heads": args.vit_n_heads,
         "freeze_visual_backbone": args.freeze_visual_backbone,
+        "visual_backbone": args.visual_backbone,
+        "visual_backbone_model": args.visual_backbone_model,
         "resume_from": args.resume,
     }
     for k, v in overrides.items():
@@ -702,6 +708,7 @@ def main():
     print(f"num_workers:     {config.num_workers}")
     print(f"max_frames:      {config.max_frames}")
     print(f"cnn_chunk_size:  {config.cnn_chunk_size}")
+    print(f"Visual backbone: {config.visual_backbone}  ({config.visual_backbone_model if config.visual_backbone == 'clip' else 'vggface2'})")
     print(f"UT-Adapters:     {config.use_ut_adapters}  (bottleneck={config.ut_adapter_dim}, k={config.ut_conv_kernel})")
     print(f"Audio fusion:    {config.audio_fusion_layers}  (Wav2Vec2 layer indices)")
     print(f"Visual fusion:   {config.visual_fusion_layers}  (temporal-layer indices)")

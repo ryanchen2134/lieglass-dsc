@@ -47,22 +47,16 @@ class FusionModel(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # Grayscale normalization buffers (1 channel)
-        self.register_buffer("_img_mean", torch.tensor([0.5]).view(1, 1, 1, 1, 1))
-        self.register_buffer("_img_std",  torch.tensor([0.25]).view(1, 1, 1, 1, 1))
-
     def forward(self, batch: dict) -> torch.Tensor:
         waveform = batch["waveform"]
         frames = batch["frames"]
         waveform_mask = batch.get("waveform_mask")
         frame_mask = batch.get("frame_mask")
 
-        # Grayscale slicing + normalization
-        if frames.shape[2] == 3:
-            frames = frames[:, :, 0:1, :, :]
+        # uint8 -> float in [0, 1]; per-backbone mean/std lives inside the
+        # visual encoder (CLIP / ArcFace use different normalization).
         if frames.dtype == torch.uint8:
             frames = frames.float().div(255.0)
-        frames = (frames - self._img_mean) / self._img_std
 
         audio_stages, a_mask = self.audio_model.forward_multistage(waveform, waveform_mask)
         visual_stages, v_mask = self.visual_model.forward_multistage(frames, frame_mask)

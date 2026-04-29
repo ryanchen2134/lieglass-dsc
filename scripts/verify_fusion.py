@@ -46,11 +46,8 @@ def main() -> None:
     assert len(audio_stages) == len(config.audio_fusion_layers)
     assert all(s.shape == audio_stages[0].shape for s in audio_stages)
 
-    # Re-normalize visual input the same way the model does internally.
-    img_mean = model._img_mean
-    img_std = model._img_std
-    frames_norm = (frames.float() - img_mean) / img_std
-    visual_stages, v_mask = model.visual_model.forward_multistage(frames_norm, frame_mask)
+    # Visual encoder owns its own normalization; just feed [0,1] floats.
+    visual_stages, v_mask = model.visual_model.forward_multistage(frames.float(), frame_mask)
     print(f"OK  visual stages: {len(visual_stages)} of {tuple(visual_stages[0].shape)};  v_mask {tuple(v_mask.shape)}")
     assert len(visual_stages) == len(config.visual_fusion_layers)
 
@@ -76,14 +73,23 @@ def main() -> None:
 
     layer0 = model.audio_model.w2v2.encoder.layers[0]
     if hasattr(layer0, "u_attn"):
-        # Wrapped layer: q_proj must be frozen; adapter must have grad.
         q_grad = layer0.attention.q_proj.weight.grad
         u_grad = layer0.u_attn.l1.weight.grad
         assert q_grad is None, "frozen Wav2Vec2 q_proj should have no grad"
         assert u_grad is not None, "UT-Adapter l1 should receive gradient"
-        print("\nOK  frozen attention has no grad; UT-Adapter has grad.")
+        print("\nOK  frozen Wav2Vec2 attention has no grad; UT-Adapter has grad.")
     else:
         print("\n(no UT-Adapters wrapped — config.use_ut_adapters is False)")
+
+    # Visual backbone must be frozen; projection must have grad.
+    backbone_params = list(model.visual_model.spatial_encoder.parameters())
+    assert all(p.requires_grad is False for p in backbone_params), \
+        "visual backbone should be fully frozen"
+    proj_grad = model.visual_model.spatial_proj.weight.grad
+    assert proj_grad is not None, "spatial_proj should receive gradient"
+    print(f"OK  visual backbone {config.visual_backbone!r} is frozen "
+          f"({sum(p.numel() for p in backbone_params):,} params); "
+          f"projection has grad.")
 
 
 if __name__ == "__main__":

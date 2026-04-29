@@ -31,11 +31,14 @@ LieGlass runs two parallel dataflows on synchronized A/V from the AR glasses:
 ### Fusion model (Dataflow A)
 
 ```
-waveform (B, T)            frames (B, N, 1, 224, 224)
+waveform (B, T)            grayscale frames (B, N, 1, 224, 224)
       |                              |
- Wav2Vec2 (frozen)            CNN_Face (per-frame)
-   + UT-Adapter ×12            + temporal Transformer (×4)
-      |                          + UT-Adapter ×4
+                                  expand 1 -> 3 channels (gray replicated)
+ Wav2Vec2 (frozen)            pretrained vision backbone (frozen):
+   + UT-Adapter ×12              "clip"    -> CLIP-ViT-B/32  (768-d)
+      |                          "arcface" -> InceptionResnetV1 / VGGFace2 (512-d)
+      |                            -> Linear projection to d_visual
+      |                            -> temporal Transformer ×4 (UT-Adapter)
       v                              v
  stages: F_1, F_mid, F_end    stages: F_1, F_mid, F_end
       \________________  ______________/
@@ -48,23 +51,27 @@ waveform (B, T)            frames (B, N, 1, 224, 224)
                classifier head -> logit (B,)
 ```
 
-Key changes from the original DOLOS implementation are documented in
-[`MODEL_SPEC.md`](MODEL_SPEC.md).
+Real-world AR-glasses input is grayscale, so the data pipeline is deliberately
+1-channel. The 1-channel frame is replicated to 3 channels inside the visual
+encoder before the RGB-pretrained backbone (standard grayscale -> pretrained
+adaptation). Key changes from the original DOLOS implementation are documented
+in [`MODEL_SPEC.md`](MODEL_SPEC.md).
 
 #### What is trained vs. frozen
 
-| Submodule                                 | Status                                  |
-| ----------------------------------------- | --------------------------------------- |
-| `Wav2Vec2.feature_extractor`              | **Frozen**                              |
-| `Wav2Vec2.feature_projection`             | **Frozen**                              |
-| `Wav2Vec2.encoder.layers[*].attention`    | **Frozen**                              |
-| `Wav2Vec2.encoder.layers[*].feed_forward` | **Frozen**                              |
-| `Wav2Vec2.encoder.layers[*].u_attn / u_ff` | **Trainable** (UT-Adapters)            |
-| `Wav2Vec2.encoder.layers[*].an1 / an2`    | **Trainable** (AdapterNorms)            |
-| `CNN_Face` spatial encoder                | Trainable (set `freeze_visual_backbone=True` to freeze) |
-| Temporal Transformer (incl. UT-Adapters)  | **Trainable**                           |
-| `MultiStageFusion` blocks + stage weights | **Trainable**                           |
-| Classifier head                           | **Trainable**                           |
+| Submodule                                  | Status                                |
+| ------------------------------------------ | ------------------------------------- |
+| `Wav2Vec2.feature_extractor`               | **Frozen**                            |
+| `Wav2Vec2.feature_projection`              | **Frozen**                            |
+| `Wav2Vec2.encoder.layers[*].attention`     | **Frozen**                            |
+| `Wav2Vec2.encoder.layers[*].feed_forward`  | **Frozen**                            |
+| `Wav2Vec2.encoder.layers[*].u_attn / u_ff` | **Trainable** (UT-Adapters)           |
+| `Wav2Vec2.encoder.layers[*].an1 / an2`     | **Trainable** (AdapterNorms)          |
+| Visual backbone (CLIP / ArcFace)           | **Frozen** (pretrained, always)       |
+| `spatial_proj` (backbone -> d_visual)      | **Trainable**                         |
+| Temporal Transformer (incl. UT-Adapters)   | **Trainable**                         |
+| `MultiStageFusion` blocks + stage weights  | **Trainable**                         |
+| Classifier head                            | **Trainable**                         |
 
 The exact frozen/trainable breakdown is printed at the start of each training fold by `print_module_summary()` in `deception_detection/models/model_utils.py`.
 
@@ -79,7 +86,7 @@ deception_detection/
   data/                     Dataset, collate, sampler, preprocessing scripts
   models/
     audio_model.py          Wav2Vec2 + UT-Adapter wrapper + multi-stage forward
-    visual_model.py         CNN_Face + temporal Transformer + UT-Adapters
+    visual_model.py         CLIP/ArcFace pretrained backbone + temporal Tx + UT-Adapters
     cross_fusion.py         BidirectionalCrossFusion + MultiStageFusion
     fusion_model.py         End-to-end FusionModel (logit output)
     adapters.py             UTAdapter, AdapterNorm, layer wrappers, freeze helper
@@ -220,6 +227,8 @@ All knobs are listed via `python -m deception_detection.train --help`. Highlight
 | `--fusion_n_heads`, `--fusion_dropout` | Cross-attention block hyperparameters.               |
 | `--wav2vec2_unfreeze_last_n`  | Only used when `--use_ut_adapters=False` (legacy fine-tune).|
 | `--vit_n_layers`, `--vit_n_heads`, `--freeze_visual_backbone` | Visual encoder shape.    |
+| `--visual_backbone {clip,arcface}` | Pretrained vision tower (always frozen).               |
+| `--visual_backbone_model`     | HuggingFace id for CLIP (e.g. `openai/clip-vit-large-patch14`). |
 
 ---
 
