@@ -37,3 +37,4 @@ preprocess_resized_errors.txt
 Thumbs.db
 
 *.pyc
+.env
