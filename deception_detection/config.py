@@ -1,4 +1,10 @@
-from dataclasses import dataclass, field
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field, fields, asdict
+from pathlib import Path
+from typing import Any
+
 import torch
 
 
@@ -69,6 +75,34 @@ class ModelConfig:
 
     # --- Device ---
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- Resume ---
+    resume_from: str | None = None       # path to last.pt; None = fresh run
+
+    # ------------------------------------------------------------------
+    # Serialization helpers
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelConfig":
+        valid = {f.name for f in fields(cls)}
+        kwargs: dict[str, Any] = {}
+        for k, v in d.items():
+            if k not in valid:
+                continue
+            # Restore tuples for fusion-layer lists (JSON round-trip stores them as list).
+            if k in ("audio_fusion_layers", "visual_fusion_layers") and isinstance(v, list):
+                v = tuple(v)
+            kwargs[k] = v
+        return cls(**kwargs)
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "ModelConfig":
+        with open(path) as f:
+            return cls.from_dict(json.load(f))
 
     def __post_init__(self):
         if len(self.audio_fusion_layers) != len(self.visual_fusion_layers):

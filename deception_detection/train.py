@@ -13,6 +13,7 @@ Or use default paths from config.py.
 import argparse
 import json
 import os
+import random
 import threading
 from dataclasses import asdict
 from datetime import datetime
@@ -31,6 +32,7 @@ from .data.dataset import DeceptionDataset
 from .data.collate import collate_fn
 from .data.sampler import make_weighted_sampler
 from .models.fusion_model import FusionModel
+from .models.model_utils import print_module_summary
 
 
 class _GPUMonitor:
@@ -223,25 +225,111 @@ def evaluate(model, loader, pos_weight, device):
     }
 
 
+def _capture_rng_states() -> dict:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng_states(state: dict) -> None:
+    if state is None:
+        return
+    try:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"])
+        if state.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["cuda"])
+    except Exception as e:
+        print(f"  [warn] could not restore RNG state: {e}", flush=True)
+
+
+def _save_full_checkpoint(
+    path: Path,
+    *,
+    fold: int,
+    epoch: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: torch.amp.GradScaler,
+    best_val_auc: float,
+    best_metrics: dict,
+    patience_counter: int,
+    fold_metrics: list,
+    config: ModelConfig,
+    run_id: str,
+) -> None:
+    """Save full training state for resumability (model + optimizer + sched + scaler + bookkeeping)."""
+    state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+    payload = {
+        "schema_version": 1,
+        "fold": fold,
+        "epoch": epoch,
+        "run_id": run_id,
+        "model_state": state,
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "scaler_state": scaler.state_dict() if scaler is not None else None,
+        "best_val_auc": float(best_val_auc),
+        "best_metrics": dict(best_metrics) if best_metrics else {},
+        "patience_counter": int(patience_counter),
+        "fold_metrics": list(fold_metrics),
+        "config": asdict(config),
+        "rng_states": _capture_rng_states(),
+    }
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)                                   # atomic on POSIX
+
+
+def _load_full_checkpoint(path: Path) -> dict:
+    payload = torch.load(path, map_location="cpu")
+    required = {"fold", "epoch", "model_state", "optimizer_state", "config"}
+    missing = required - set(payload)
+    if missing:
+        raise ValueError(f"Checkpoint at {path} missing required keys: {missing}")
+    return payload
+
+
 def run_cross_validation(config: ModelConfig):
     device = torch.device(config.device)
     root = Path(__file__).resolve().parents[1]
     manifest = root / config.manifest_csv
     feature_dir = root / config.feature_dir
 
-    # Per-run output directory: checkpoints/<timestamp>/
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ckpt_dir = root / config.checkpoint_dir / run_id
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # ------------------------------------------------------------------
+    # Resume bookkeeping
+    # ------------------------------------------------------------------
+    resume_payload: dict | None = None
+    if config.resume_from:
+        resume_path = Path(config.resume_from)
+        if not resume_path.is_absolute():
+            resume_path = root / resume_path
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        resume_payload = _load_full_checkpoint(resume_path)
+        run_id = resume_payload["run_id"]
+        ckpt_dir = resume_path.parent
+        print(f"Resuming from:   {resume_path}", flush=True)
+        print(f"  Saved at fold={resume_payload['fold']} epoch={resume_payload['epoch']}", flush=True)
+    else:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ckpt_dir = root / config.checkpoint_dir / run_id
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir:         {ckpt_dir}", flush=True)
 
-    # A) Persist run configuration
+    # A) Persist run configuration (overwrite on resume so post-resume overrides are recorded)
     config_path = ckpt_dir / "config.json"
     with config_path.open("w") as f:
         json.dump(asdict(config), f, indent=2, default=str)
 
     # B) Per-fold metrics JSON (rewritten after each fold so partial runs are saved)
     metrics_path = ckpt_dir / "metrics.json"
+    last_ckpt_path = ckpt_dir / "last.pt"
 
     # Load full dataset for CV splitting
     full_dataset = DeceptionDataset(
@@ -280,11 +368,22 @@ def run_cross_validation(config: ModelConfig):
     with (ckpt_dir / "splits.json").open("w") as f:
         json.dump(splits_record, f, indent=2)
 
-    fold_metrics = []
+    # Restore prior fold metrics if resuming.
+    fold_metrics = list(resume_payload["fold_metrics"]) if resume_payload else []
+    resume_fold = resume_payload["fold"] if resume_payload else -1
+    resume_epoch = resume_payload["epoch"] if resume_payload else -1
+    if resume_payload is not None:
+        _restore_rng_states(resume_payload.get("rng_states"))
+
     monitor = _GPUMonitor(interval=2)
     monitor.start()
 
     for fold, (train_idx, val_idx) in enumerate(splits):
+        # Skip folds that were already completed before the resume checkpoint.
+        if fold < resume_fold:
+            print(f"\n[resume] Skipping fold {fold + 1}/{len(splits)} — already completed.", flush=True)
+            continue
+
         print(f"\n{'='*60}", flush=True)
         print(f"Fold {fold + 1}/{len(splits)}", flush=True)
         print(f"{'='*60}", flush=True)
@@ -358,6 +457,11 @@ def run_cross_validation(config: ModelConfig):
         if hasattr(torch, "compile"):
             #model = torch.compile(model, mode="reduce-overhead")
             model = model.to(device)
+
+        # Detailed module-level frozen/trainable breakdown
+        underlying = model.module if isinstance(model, torch.nn.DataParallel) else model
+        print_module_summary(underlying)
+
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         n_trainable = sum(p.numel() for p in trainable_params)
         n_total = sum(p.numel() for p in model.parameters())
@@ -379,10 +483,29 @@ def run_cross_validation(config: ModelConfig):
         scaler = torch.amp.GradScaler(device.type, enabled=(device.type == "cuda"))
 
         best_val_auc = 0.0
-        best_metrics = {}
+        best_metrics: dict = {}
         patience_counter = 0
+        start_epoch = 0
 
-        for epoch in range(config.max_epochs):
+        # Restore mid-fold state on resume.
+        if resume_payload is not None and fold == resume_fold:
+            target = model.module if isinstance(model, torch.nn.DataParallel) else model
+            target.load_state_dict(resume_payload["model_state"])
+            optimizer.load_state_dict(resume_payload["optimizer_state"])
+            if resume_payload.get("scheduler_state") is not None:
+                scheduler.load_state_dict(resume_payload["scheduler_state"])
+            if resume_payload.get("scaler_state") is not None:
+                scaler.load_state_dict(resume_payload["scaler_state"])
+            best_val_auc = float(resume_payload.get("best_val_auc", 0.0))
+            best_metrics = dict(resume_payload.get("best_metrics") or {})
+            patience_counter = int(resume_payload.get("patience_counter", 0))
+            start_epoch = int(resume_payload["epoch"]) + 1
+            print(f"  [resume] continuing from epoch {start_epoch + 1}/{config.max_epochs}, "
+                  f"best_auc={best_val_auc:.3f}, patience={patience_counter}", flush=True)
+            # Only consume the resume payload once.
+            resume_payload = None
+
+        for epoch in range(start_epoch, config.max_epochs):
             monitor.reset_epoch()
             print(f"=== Epoch {epoch+1}/{config.max_epochs} ===", flush=True)
             train_loss, train_acc = train_one_epoch(
@@ -419,9 +542,22 @@ def run_cross_validation(config: ModelConfig):
                 torch.save(state, ckpt_dir / f"fold_{fold}_best.pt")
             else:
                 patience_counter += 1
-                if patience_counter >= config.patience:
-                    print(f"  Early stopping at epoch {epoch + 1}", flush=True)
-                    break
+
+            # Always save the latest full training state for resumability — written after
+            # the best-checkpoint update so ``last.pt`` reflects the current best_val_auc.
+            _save_full_checkpoint(
+                last_ckpt_path,
+                fold=fold, epoch=epoch,
+                model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
+                best_val_auc=best_val_auc, best_metrics=best_metrics,
+                patience_counter=patience_counter,
+                fold_metrics=fold_metrics,
+                config=config, run_id=run_id,
+            )
+
+            if patience_counter >= config.patience:
+                print(f"  Early stopping at epoch {epoch + 1}", flush=True)
+                break
 
         print(f"\n  Fold {fold+1} best: auc={best_metrics.get('auc_roc', 0):.3f} "
               f"f1={best_metrics.get('f1', 0):.3f} acc={best_metrics.get('accuracy', 0):.3f}", flush=True)
@@ -463,43 +599,99 @@ def main():
         print("CUDA not available, using CPU")
     
     
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Train the bidirectional UT-Adapter fusion model with k-fold CV.",
+    )
+    # I/O
+    parser.add_argument("--config", default=None, help="Path to JSON config; CLI flags override.")
+    parser.add_argument("--resume", default=None, help="Path to last.pt to resume training from.")
     parser.add_argument("--manifest", default=None)
     parser.add_argument("--feature_dir", default=None)
     parser.add_argument("--checkpoint_dir", default=None)
     parser.add_argument("--device", default=None)
+
+    # Training
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--folds", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None,
                         help="DataLoader workers (0=safe default; 4 after extract_frames.py)")
     parser.add_argument("--grad_accum", type=int, default=None,
                         help="Gradient accumulation steps (effective_batch = batch_size × steps)")
     parser.add_argument("--max_frames", type=int, default=None,
-                        help="Cap on frames per clip (None = use all). Full-frame pipeline default is 400.")
+                        help="Cap on frames per clip (None = use all).")
+    parser.add_argument("--lr", type=float, default=None, help="Peak learning rate (OneCycleLR max_lr).")
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument("--patience", type=int, default=None)
+    parser.add_argument("--label_smoothing", type=float, default=None)
+    parser.add_argument("--grad_clip", type=float, default=None)
+    parser.add_argument("--dropout", type=float, default=None)
+
+    # Adapters / fusion
+    parser.add_argument("--use_ut_adapters", type=lambda v: v.lower() in ("1","true","yes","y","t"), default=None)
+    parser.add_argument("--ut_adapter_dim", type=int, default=None)
+    parser.add_argument("--ut_conv_kernel", type=int, default=None)
+    parser.add_argument("--audio_fusion_layers", default=None,
+                        help="Comma-separated 1-indexed Wav2Vec2 layer indices, e.g. 4,8,12.")
+    parser.add_argument("--visual_fusion_layers", default=None,
+                        help="Comma-separated 1-indexed temporal-layer indices, e.g. 1,2,4.")
+    parser.add_argument("--fusion_aggregator", default=None, choices=["sum", "weighted_sum"])
+    parser.add_argument("--fusion_n_heads", type=int, default=None)
+    parser.add_argument("--fusion_dropout", type=float, default=None)
+    parser.add_argument("--wav2vec2_unfreeze_last_n", type=int, default=None,
+                        help="Only used when --use_ut_adapters=False.")
+    parser.add_argument("--vit_n_layers", type=int, default=None)
+    parser.add_argument("--vit_n_heads", type=int, default=None)
+    parser.add_argument("--freeze_visual_backbone", type=lambda v: v.lower() in ("1","true","yes","y","t"), default=None)
     args = parser.parse_args()
 
-    config = ModelConfig()
-    if args.manifest:
-        config.manifest_csv = args.manifest
-    if args.feature_dir:
-        config.feature_dir = args.feature_dir
-    if args.checkpoint_dir:
-        config.checkpoint_dir = args.checkpoint_dir
-    if args.device:
-        config.device = args.device
-    if args.batch_size:
-        config.batch_size = args.batch_size
-    if args.epochs:
-        config.max_epochs = args.epochs
-    if args.folds:
-        config.n_folds = args.folds
-    if args.num_workers is not None:
-        config.num_workers = args.num_workers
-    if args.grad_accum is not None:
-        config.grad_accum_steps = args.grad_accum
-    if args.max_frames is not None:
-        config.max_frames = args.max_frames
+    # Build config: JSON file (if any) -> CLI overrides.
+    if args.config:
+        config = ModelConfig.from_json(args.config)
+    else:
+        config = ModelConfig()
+
+    def _parse_int_csv(s: str) -> tuple:
+        return tuple(int(x) for x in s.split(",") if x.strip())
+
+    overrides = {
+        "manifest_csv": args.manifest,
+        "feature_dir": args.feature_dir,
+        "checkpoint_dir": args.checkpoint_dir,
+        "device": args.device,
+        "batch_size": args.batch_size,
+        "max_epochs": args.epochs,
+        "n_folds": args.folds,
+        "seed": args.seed,
+        "num_workers": args.num_workers,
+        "grad_accum_steps": args.grad_accum,
+        "max_frames": args.max_frames,
+        "learning_rate": args.lr,
+        "weight_decay": args.weight_decay,
+        "patience": args.patience,
+        "label_smoothing": args.label_smoothing,
+        "grad_clip": args.grad_clip,
+        "dropout": args.dropout,
+        "use_ut_adapters": args.use_ut_adapters,
+        "ut_adapter_dim": args.ut_adapter_dim,
+        "ut_conv_kernel": args.ut_conv_kernel,
+        "audio_fusion_layers": _parse_int_csv(args.audio_fusion_layers) if args.audio_fusion_layers else None,
+        "visual_fusion_layers": _parse_int_csv(args.visual_fusion_layers) if args.visual_fusion_layers else None,
+        "fusion_aggregator": args.fusion_aggregator,
+        "fusion_n_heads": args.fusion_n_heads,
+        "fusion_dropout": args.fusion_dropout,
+        "wav2vec2_unfreeze_last_n": args.wav2vec2_unfreeze_last_n,
+        "vit_n_layers": args.vit_n_layers,
+        "vit_n_heads": args.vit_n_heads,
+        "freeze_visual_backbone": args.freeze_visual_backbone,
+        "resume_from": args.resume,
+    }
+    for k, v in overrides.items():
+        if v is not None:
+            setattr(config, k, v)
+    # Re-run validation after CLI overrides.
+    config.__post_init__()
 
     print(f"Device:          {config.device}")
     print(f"Manifest:        {config.manifest_csv}")
@@ -510,6 +702,12 @@ def main():
     print(f"num_workers:     {config.num_workers}")
     print(f"max_frames:      {config.max_frames}")
     print(f"cnn_chunk_size:  {config.cnn_chunk_size}")
+    print(f"UT-Adapters:     {config.use_ut_adapters}  (bottleneck={config.ut_adapter_dim}, k={config.ut_conv_kernel})")
+    print(f"Audio fusion:    {config.audio_fusion_layers}  (Wav2Vec2 layer indices)")
+    print(f"Visual fusion:   {config.visual_fusion_layers}  (temporal-layer indices)")
+    print(f"Fusion agg:      {config.fusion_aggregator}  (n_heads={config.fusion_n_heads}, dropout={config.fusion_dropout})")
+    if config.resume_from:
+        print(f"Resume from:     {config.resume_from}")
 
     run_cross_validation(config)
 
