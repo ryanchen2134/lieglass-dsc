@@ -22,8 +22,22 @@ def _key(param_name: str) -> str:
 
 
 def _module_path(param_name: str) -> str:
-    """Strip trailing ``.weight`` / ``.bias`` / ``.in_proj_weight`` etc."""
-    return param_name.rsplit(".", 1)[0]
+    """Return the parent module path of a parameter.
+
+    For a parameter belonging to a sub-module (e.g. ``foo.bar.weight``), this is
+    the parent module (``foo.bar``). For a bare ``nn.Parameter`` registered
+    directly on a module (e.g. ``foo.pos_embedding``), the strip would collapse
+    onto the parent module name and lose the parameter name; we instead keep
+    the full name so it's distinguishable from sub-module rows.
+    """
+    parent, _, leaf = param_name.rpartition(".")
+    # nn.Module sub-parameter conventions; everything else (custom nn.Parameter
+    # names like ``pos_embedding``) we keep verbatim so the row label includes it.
+    if leaf in {"weight", "bias", "in_proj_weight", "in_proj_bias",
+                "out_proj_weight", "out_proj_bias", "running_mean",
+                "running_var", "num_batches_tracked"}:
+        return parent
+    return param_name
 
 
 def _format_n(n: int) -> str:
@@ -73,8 +87,10 @@ def summarize_modules(model: nn.Module, max_rows_per_top: int = 200) -> str:
 
     grand_tr, grand_tot = 0, 0
     for top, entries in grouped.items():
-        # Sort by depth then alphabetically so the natural read order is preserved.
-        entries.sort(key=lambda kv: (kv[0].count("."), kv[0]))
+        # Alphabetic sort on the collapsed key keeps each submodule's rows
+        # contiguous (e.g. all ``spatial_encoder.*`` together; all
+        # ``temporal_layers[*].*`` together) instead of interleaving by depth.
+        entries.sort(key=lambda kv: kv[0])
         top_tr = sum(e[1]["trainable"] for e in entries)
         top_tot = sum(e[1]["total"] for e in entries)
         grand_tr += top_tr
