@@ -15,6 +15,21 @@ Everyone has a tell. Now we have the tools to find it. 🕵️
 
 **Systems Operative**, Max Pinderski
 
+## Model Architecture
+<p align="center">
+  <img src="assets/lieglassmodel.jpg" alt="Lie Glass Model Architecture" width="700"/>
+</p>
+
+<p align="center">
+  <em>
+    Architecture overview of the Lie Glass model. AR glasses capture a synchronized video and audio stream, 
+    which is processed through two parallel dataflows. Dataflow A extracts visual embeddings via a 
+    ViT-B/16 encoder and audio embeddings via a frozen Wav2Vec2 transformer, fusing them through a 
+    CrossFusionModule into a deception probability score. Dataflow B transcribes speech with OpenAI 
+    Whisper and passes the transcript to an LLM to detect inconsistencies, generating real-time 
+    HUD prompts. The model is trained end-to-end with BCE-with-logits loss and label smoothing.
+  </em>
+</p>
 
 # lieglass-dsc
 
