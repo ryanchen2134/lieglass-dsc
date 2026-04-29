@@ -11,8 +11,11 @@ Or use default paths from config.py.
 """
 
 import argparse
+import json
 import os
 import threading
+from dataclasses import asdict
+from datetime import datetime
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -225,8 +228,20 @@ def run_cross_validation(config: ModelConfig):
     root = Path(__file__).resolve().parents[1]
     manifest = root / config.manifest_csv
     feature_dir = root / config.feature_dir
-    ckpt_dir = root / config.checkpoint_dir
+
+    # Per-run output directory: checkpoints/<timestamp>/
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ckpt_dir = root / config.checkpoint_dir / run_id
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run dir:         {ckpt_dir}", flush=True)
+
+    # A) Persist run configuration
+    config_path = ckpt_dir / "config.json"
+    with config_path.open("w") as f:
+        json.dump(asdict(config), f, indent=2, default=str)
+
+    # B) Per-fold metrics JSON (rewritten after each fold so partial runs are saved)
+    metrics_path = ckpt_dir / "metrics.json"
 
     # Load full dataset for CV splitting
     full_dataset = DeceptionDataset(
@@ -245,6 +260,26 @@ def run_cross_validation(config: ModelConfig):
     else:
         skf = StratifiedKFold(n_splits=config.n_folds, shuffle=True, random_state=config.seed)
         splits = list(skf.split(indices, labels))
+
+    # Record which sample IDs went into train vs val for each fold
+    sample_ids = [sid for sid, _ in full_dataset.samples]
+    splits_record = [
+        {
+            "fold": i,
+            "train": [
+                {"sample_id": sample_ids[j], "label": int(labels[j])}
+                for j in train_idx.tolist()
+            ],
+            "val": [
+                {"sample_id": sample_ids[j], "label": int(labels[j])}
+                for j in val_idx.tolist()
+            ],
+        }
+        for i, (train_idx, val_idx) in enumerate(splits)
+    ]
+    with (ckpt_dir / "splits.json").open("w") as f:
+        json.dump(splits_record, f, indent=2)
+
     fold_metrics = []
     monitor = _GPUMonitor(interval=2)
     monitor.start()
@@ -391,6 +426,14 @@ def run_cross_validation(config: ModelConfig):
         print(f"\n  Fold {fold+1} best: auc={best_metrics.get('auc_roc', 0):.3f} "
               f"f1={best_metrics.get('f1', 0):.3f} acc={best_metrics.get('accuracy', 0):.3f}", flush=True)
         fold_metrics.append(best_metrics)
+
+        # Persist metrics incrementally — one object per fold
+        with metrics_path.open("w") as f:
+            json.dump(
+                [{"fold": i, **m} for i, m in enumerate(fold_metrics)],
+                f,
+                indent=2,
+            )
 
         # Free GPU memory before the next fold's model is allocated
         del model, optimizer, scheduler, scaler
