@@ -260,6 +260,26 @@ def run_cross_validation(config: ModelConfig):
     else:
         skf = StratifiedKFold(n_splits=config.n_folds, shuffle=True, random_state=config.seed)
         splits = list(skf.split(indices, labels))
+
+    # Record which sample IDs went into train vs val for each fold
+    sample_ids = [sid for sid, _ in full_dataset.samples]
+    splits_record = [
+        {
+            "fold": i,
+            "train": [
+                {"sample_id": sample_ids[j], "label": int(labels[j])}
+                for j in train_idx.tolist()
+            ],
+            "val": [
+                {"sample_id": sample_ids[j], "label": int(labels[j])}
+                for j in val_idx.tolist()
+            ],
+        }
+        for i, (train_idx, val_idx) in enumerate(splits)
+    ]
+    with (ckpt_dir / "splits.json").open("w") as f:
+        json.dump(splits_record, f, indent=2)
+
     fold_metrics = []
     monitor = _GPUMonitor(interval=2)
     monitor.start()
