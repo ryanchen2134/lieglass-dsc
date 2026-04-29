@@ -24,8 +24,6 @@ checkpoints/
 *.pth
 *.ckpt
 
-# Feature data (large, generated)
-features/
 
 # Logs & errors
 *.log
