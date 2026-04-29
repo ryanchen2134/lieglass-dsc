@@ -42,6 +42,8 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as checkpoint
 from transformers import ViTModel, ViTConfig
 
+from .adapters import UTAdapterVisualLayer
+
 
 # ---------------------------------------------------------------------------
 # Per-frame CNN
@@ -159,42 +161,92 @@ def _sinusoidal_pe(seq_len: int, d_model: int, device, dtype) -> torch.Tensor:
 class ViT_Model(nn.Module): # Rename this to VisualModel eventually
     def __init__(self, config):
         super().__init__()
-        # Use your custom CNN instead of the heavy HuggingFace ViT
-        self.spatial_encoder = CNN_Face(output_dim=config.d_visual) 
-        
-        # Keep a smaller temporal transformer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_visual, 
-            nhead=config.vit_n_heads, # 4
-            dim_feedforward=512,      # Reduced from 2048
-            dropout=config.dropout,   # 0.6
-            batch_first=True
-        )
-        self.temporal_transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.vit_n_layers)
+        self.spatial_encoder = CNN_Face(output_dim=config.d_visual)
+
+        self.use_ut_adapters = bool(getattr(config, "use_ut_adapters", False))
+        self.fusion_layers = sorted(set(config.visual_fusion_layers))
+        if max(self.fusion_layers) > config.vit_n_layers or min(self.fusion_layers) < 1:
+            raise ValueError(
+                f"visual_fusion_layers={self.fusion_layers} out of range [1, {config.vit_n_layers}]."
+            )
+
+        if self.use_ut_adapters:
+            self.temporal_layers = nn.ModuleList([
+                UTAdapterVisualLayer(
+                    d_model=config.d_visual,
+                    n_heads=config.vit_n_heads,
+                    dim_ff=512,
+                    dropout=config.dropout,
+                    bottleneck=config.ut_adapter_dim,
+                    conv_kernel=config.ut_conv_kernel,
+                )
+                for _ in range(config.vit_n_layers)
+            ])
+        else:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=config.d_visual,
+                nhead=config.vit_n_heads,
+                dim_feedforward=512,
+                dropout=config.dropout,
+                batch_first=True,
+            )
+            # Stored as ModuleList of plain layers so iteration code is uniform.
+            self.temporal_layers = nn.ModuleList([encoder_layer for _ in range(config.vit_n_layers)])
+
         self.pos_embedding = nn.Parameter(torch.zeros(1, config.max_frames, config.d_visual))
 
-    def forward(self, x, mask=None):
+        if getattr(config, "freeze_visual_backbone", False):
+            for p in self.spatial_encoder.parameters():
+                p.requires_grad = False
+
+    # ------------------------------------------------------------------
+    # CNN trunk (chunked + checkpointed)
+    # ------------------------------------------------------------------
+
+    def _spatial_features(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C, H, W = x.shape
-        chunk_size = 16 
+        chunk_size = 16
         all_features = []
-        
         for i in range(0, N, chunk_size):
             chunk = x[:, i : i + chunk_size].reshape(-1, C, H, W)
-            
-            # REPLACEMENT: Wrap the CNN in checkpoint
-            # This deletes intermediate activations and recalculates them on backward pass
-            f = checkpoint(
-                self.spatial_encoder, 
-                chunk, 
-                use_reentrant=False
-            )
-            
+            f = checkpoint(self.spatial_encoder, chunk, use_reentrant=False)
             all_features.append(f.view(B, -1, f.shape[-1]))
-            
-        features = torch.cat(all_features, dim=1)
-        
-        # Temporal processing
+        return torch.cat(all_features, dim=1)                  # (B, N, d_visual)
+
+    def _run_temporal(self, features: torch.Tensor, mask: torch.Tensor | None
+                      ) -> list[torch.Tensor]:
+        key_padding_mask = ~mask if mask is not None else None
+        h = features
+        stages = []
+        for i, layer in enumerate(self.temporal_layers, start=1):
+            if isinstance(layer, UTAdapterVisualLayer):
+                h = layer(h, src_key_padding_mask=key_padding_mask)
+            else:
+                h = layer(h, src_key_padding_mask=key_padding_mask)
+            if i in self.fusion_layers:
+                stages.append(h)
+        return stages
+
+    # ------------------------------------------------------------------
+    # Multi-stage forward
+    # ------------------------------------------------------------------
+
+    def forward_multistage(self, x: torch.Tensor, mask: torch.Tensor | None = None
+                           ) -> tuple[list[torch.Tensor], torch.Tensor | None]:
+        features = self._spatial_features(x)
+        N = features.shape[1]
         features = features + self.pos_embedding[:, :N, :]
-        out = self.temporal_transformer(features, src_key_padding_mask=~mask if mask is not None else None)
-        
-        return out.mean(dim=1)
+        stages = self._run_temporal(features, mask)
+        return stages, mask
+
+    # ------------------------------------------------------------------
+    # Backwards-compatible single-vector forward
+    # ------------------------------------------------------------------
+
+    def forward(self, x, mask=None):
+        stages, m = self.forward_multistage(x, mask)
+        last = stages[-1]                                        # (B, N, d_visual)
+        if m is None:
+            return last.mean(dim=1)
+        mf = m.unsqueeze(-1).float()
+        return (last * mf).sum(dim=1) / mf.sum(dim=1).clamp(min=1.0)

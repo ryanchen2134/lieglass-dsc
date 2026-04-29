@@ -32,6 +32,17 @@ class ModelConfig:
     d_fused: int = 256
     dropout: float = 0.6
 
+    # --- UT-Adapters & multi-stage PAVF (DOLOS) ---
+    use_ut_adapters: bool = True
+    ut_adapter_dim: int = 128                                  # bottleneck per UT spec
+    ut_conv_kernel: int = 3
+    audio_fusion_layers: tuple = (4, 8, 12)                    # 1-indexed Wav2Vec2 layers
+    visual_fusion_layers: tuple = (1, 2, 4)                    # 1-indexed temporal layers
+    fusion_aggregator: str = "weighted_sum"                    # "sum" | "weighted_sum"
+    freeze_visual_backbone: bool = False
+    fusion_n_heads: int = 8
+    fusion_dropout: float = 0.2
+
     # --- Training ---
     batch_size: int = 8                 # smaller default — clips are longer now
     learning_rate: float = 4e-5
@@ -58,3 +69,17 @@ class ModelConfig:
 
     # --- Device ---
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
+
+    def __post_init__(self):
+        if len(self.audio_fusion_layers) != len(self.visual_fusion_layers):
+            raise ValueError(
+                f"audio_fusion_layers ({self.audio_fusion_layers}) and "
+                f"visual_fusion_layers ({self.visual_fusion_layers}) must have equal length."
+            )
+        if max(self.visual_fusion_layers) > self.vit_n_layers:
+            raise ValueError(
+                f"max(visual_fusion_layers)={max(self.visual_fusion_layers)} "
+                f"exceeds vit_n_layers={self.vit_n_layers}."
+            )
+        if self.fusion_aggregator not in ("sum", "weighted_sum"):
+            raise ValueError(f"Unknown fusion_aggregator: {self.fusion_aggregator!r}")
