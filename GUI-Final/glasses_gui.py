@@ -1,3 +1,4 @@
+import argparse
 import ttkbootstrap as ttk
 import tkinter as tk
 from PIL import Image, ImageTk # You'll need: pip install pillow
@@ -5,6 +6,7 @@ import os
 import queue
 import threading
 import time
+from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
 
@@ -16,12 +18,90 @@ from inference import LocalInferenceProcessor
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv()
 
+# Repo root: GUI-Final/glasses_gui.py -> parent.parent = repo root
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CHECKPOINTS_DIR = REPO_ROOT / "checkpoints"
+
+
+def _resolve_checkpoint(run: str | None, fold: int | None,
+                        checkpoint: str | None,
+                        checkpoints_dir: Path) -> tuple[Path, Path | None]:
+    """Resolve (checkpoint_pt, config_json) from CLI args.
+
+    Precedence:
+      1. ``--checkpoint`` (explicit .pt path)
+      2. ``--run`` (folder name under checkpoints/) + optional ``--fold``
+      3. Latest run under ``checkpoints/`` (sorted name desc) + fold 0
+    """
+    if checkpoint:
+        ckpt = Path(checkpoint).expanduser().resolve()
+        if not ckpt.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+        cfg = ckpt.parent / "config.json"
+        return ckpt, cfg if cfg.is_file() else None
+
+    if run:
+        run_dir = Path(run).expanduser()
+        if not run_dir.is_absolute():
+            run_dir = (checkpoints_dir / run_dir).resolve()
+    else:
+        if not checkpoints_dir.is_dir():
+            raise FileNotFoundError(f"No checkpoints directory: {checkpoints_dir}")
+        candidates = sorted([p for p in checkpoints_dir.iterdir() if p.is_dir()])
+        if not candidates:
+            raise FileNotFoundError(f"No runs found under {checkpoints_dir}")
+        run_dir = candidates[-1]
+        print(f"[gui] Auto-selected latest run: {run_dir.name}")
+
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+
+    fold_idx = 0 if fold is None else int(fold)
+    ckpt = run_dir / f"fold_{fold_idx}_best.pt"
+    if not ckpt.is_file():
+        # Fall back: try last.pt, otherwise the first fold present.
+        last = run_dir / "last.pt"
+        if last.is_file():
+            ckpt = last
+        else:
+            folds = sorted(run_dir.glob("fold_*_best.pt"))
+            if not folds:
+                raise FileNotFoundError(f"No checkpoint .pt found in {run_dir}")
+            ckpt = folds[0]
+    cfg = run_dir / "config.json"
+    return ckpt, cfg if cfg.is_file() else None
+
+
+parser = argparse.ArgumentParser(description="LieGlass GUI")
+parser.add_argument("--run", type=str, default=None,
+                    help="Run name under checkpoints/ (e.g. 20260429_055701) or absolute path.")
+parser.add_argument("--fold", type=int, default=None,
+                    help="Fold index to load (default: 0). Falls back to last.pt.")
+parser.add_argument("--checkpoint", type=str, default=None,
+                    help="Explicit path to a .pt file (overrides --run/--fold).")
+parser.add_argument("--checkpoints-dir", type=str, default=str(DEFAULT_CHECKPOINTS_DIR),
+                    help=f"Directory containing run folders (default: {DEFAULT_CHECKPOINTS_DIR}).")
+args, _ = parser.parse_known_args()
+
+ckpt_path, cfg_path = _resolve_checkpoint(
+    run=args.run,
+    fold=args.fold,
+    checkpoint=args.checkpoint,
+    checkpoints_dir=Path(args.checkpoints_dir).expanduser().resolve(),
+)
+print(f"[gui] Using checkpoint: {ckpt_path}")
+print(f"[gui] Using config:     {cfg_path if cfg_path else '(default ModelConfig)'}")
+
 llm_queue = queue.Queue()
 truth_score_queue = queue.Queue()
 face_queue = queue.Queue(maxsize=1) # Queue for the face preview
 
 # --- START SUBSYSTEMS ---
-inference_engine = LocalInferenceProcessor("Deploy/fold_1_best.pt", truth_score_queue)
+inference_engine = LocalInferenceProcessor(
+    checkpoint_path=ckpt_path,
+    result_queue=truth_score_queue,
+    config_path=cfg_path,
+)
 inference_engine.start()
 
 # Pass the face_queue to xreal.main so it can send the crops back
