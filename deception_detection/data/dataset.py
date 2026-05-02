@@ -16,7 +16,34 @@ Both sources are fork-safe (pure NumPy) so ``num_workers > 0`` is always safe.
 from __future__ import annotations
 
 import csv
+import re
 from pathlib import Path
+
+
+# Group-extraction patterns for leakage-safe cross-validation.
+#   DOLOS sample IDs look like ``<group>_EP<num>_<...>`` where ``<group>``
+#   identifies a contestant (e.g. ``AN_WILTY``, ``LS_WILTY``). All clips
+#   from the same contestant — across every episode and every clip type —
+#   must stay in the same fold.
+#
+#   RLT sample IDs look like ``<group>_Chunk<num>`` where ``<group>``
+#   identifies a single trial (e.g. ``trial_truth_036``). All chunks of
+#   the same trial must stay in the same fold.
+_DOLOS_GROUP_RE = re.compile(r"^(.+?)_EP\d+")
+_RLT_GROUP_RE = re.compile(r"^(.+?)_Chunk\d+")
+
+
+def extract_group(sample_id: str) -> str:
+    """Return the leakage-safe group key for a manifest sample ID."""
+    m = _DOLOS_GROUP_RE.match(sample_id)
+    if m:
+        return m.group(1)
+    m = _RLT_GROUP_RE.match(sample_id)
+    if m:
+        return m.group(1)
+    # Fallback: treat the sample as its own singleton group so it remains
+    # usable with group-aware splitters even if the naming is unfamiliar.
+    return sample_id
 
 import numpy as np
 import torch
@@ -180,6 +207,10 @@ class DeceptionDataset(Dataset):
 
     def get_labels(self) -> list[int]:
         return [label for _, label in self.samples]
+
+    def get_groups(self) -> list[str]:
+        """Group key per sample for leakage-safe (group-aware) CV splits."""
+        return [extract_group(sid) for sid, _ in self.samples]
 
     def __len__(self) -> int:
         return len(self.samples)

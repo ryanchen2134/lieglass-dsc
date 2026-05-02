@@ -23,7 +23,10 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.model_selection import (
+    GroupShuffleSplit,
+    StratifiedGroupKFold,
+)
 from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 from pathlib import Path
 
@@ -339,15 +342,27 @@ def run_cross_validation(config: ModelConfig):
         legacy_n_frames=config.legacy_n_frames,
     )
     labels = full_dataset.get_labels()
+    groups = full_dataset.get_groups()
     indices = list(range(len(full_dataset)))
 
+    n_groups = len(set(groups))
+    print(f"Group-aware CV: {n_groups} groups across {len(indices)} samples", flush=True)
+
     if config.n_folds == 1:
-        # Smoke-test mode: single 80/20 stratified split
-        sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=config.seed)
-        splits = list(sss.split(indices, labels))
+        # Smoke-test mode: single 80/20 group-aware split (no group leaks
+        # between train and val).
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=config.seed)
+        splits = list(gss.split(indices, labels, groups=groups))
     else:
-        skf = StratifiedKFold(n_splits=config.n_folds, shuffle=True, random_state=config.seed)
-        splits = list(skf.split(indices, labels))
+        if config.n_folds > n_groups:
+            raise ValueError(
+                f"n_folds={config.n_folds} exceeds number of unique groups "
+                f"({n_groups}); reduce --folds or check sample naming."
+            )
+        sgkf = StratifiedGroupKFold(
+            n_splits=config.n_folds, shuffle=True, random_state=config.seed
+        )
+        splits = list(sgkf.split(indices, labels, groups=groups))
 
     # Record which sample IDs went into train vs val for each fold
     sample_ids = [sid for sid, _ in full_dataset.samples]
@@ -355,11 +370,11 @@ def run_cross_validation(config: ModelConfig):
         {
             "fold": i,
             "train": [
-                {"sample_id": sample_ids[j], "label": int(labels[j])}
+                {"sample_id": sample_ids[j], "label": int(labels[j]), "group": groups[j]}
                 for j in train_idx.tolist()
             ],
             "val": [
-                {"sample_id": sample_ids[j], "label": int(labels[j])}
+                {"sample_id": sample_ids[j], "label": int(labels[j]), "group": groups[j]}
                 for j in val_idx.tolist()
             ],
         }
