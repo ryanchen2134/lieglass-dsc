@@ -25,14 +25,12 @@ class ModelConfig:
     #                 Hidden size: 768 for ViT-B/32, 1024 for ViT-L/14.
     #   "arcface"  -> face-pretrained ResNet trunk (FaceNet/InceptionResnetV1
     #                 from facenet-pytorch with VGGFace2 weights). 512-d output.
-    visual_backbone: str = "clip"
-    visual_backbone_model: str = "openai/clip-vit-base-patch32"
+    visual_backbone: str = "arcface"
+    visual_backbone_model: str = "openai/clip-vit-base-patch32"  # only used when visual_backbone == "clip"
 
-    vit_model: str = "google/vit-base-patch16-224"   # retained for old configs; unused
     d_visual: int = 768
     vit_n_layers: int = 4               # temporal Transformer depth
     vit_n_heads: int = 8                # multi-head attention heads
-    vit_unfreeze_last_n: int = 0        # retained for compat; all temporal layers are trainable
     cnn_chunk_size: int = 32            # frames per backbone forward (caps peak activation)
     in_channels: int = 1                # deliberately grayscale (real-life AR-glasses input)
 
@@ -54,19 +52,21 @@ class ModelConfig:
     audio_fusion_layers: tuple = (4, 8, 12)                    # 1-indexed Wav2Vec2 layers
     visual_fusion_layers: tuple = (1, 2, 4)                    # 1-indexed temporal layers
     fusion_aggregator: str = "weighted_sum"                    # "sum" | "weighted_sum"
-    freeze_visual_backbone: bool = False
+    freeze_visual_backbone: bool = True
     fusion_n_heads: int = 8
     fusion_dropout: float = 0.2
 
     # --- Training ---
-    batch_size: int = 8                 # smaller default — clips are longer now
-    learning_rate: float = 4e-5
+    # Defaults tuned for 4× V100 (DataParallel). batch_size is the global
+    # mini-batch shared across GPUs; learning_rate is linearly scaled vs
+    # the previous single-GPU default (8 → 32, 4e-5 → 1.6e-4).
+    batch_size: int = 32
+    learning_rate: float = 1.6e-4
     weight_decay: float = 0.20
     max_epochs: int = 60
     patience: int = 8
     grad_clip: float = 1.0
     label_smoothing: float = 0.1
-    pos_weight: float = 2.33            # placeholder; sampler balances classes
     grad_accum_steps: int = 8           # effective_batch = batch_size × steps
 
     # --- Cross-validation ---
@@ -75,7 +75,7 @@ class ModelConfig:
 
     # --- Paths ---
     feature_dir: str = "features"
-    manifest_csv: str = "Data/mixed_manifest.csv"
+    manifest_csv: str = "Data/manifest_mixed.csv"
     checkpoint_dir: str = "checkpoints"
 
     # --- DataLoader ---

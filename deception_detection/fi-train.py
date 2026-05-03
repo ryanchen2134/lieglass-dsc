@@ -373,8 +373,13 @@ def run_cross_validation(config: ModelConfig):
         optimizer = AdamW(trainable_params, lr=config.learning_rate, weight_decay=config.weight_decay)
 
         # OneCycleLR counts parameter updates, not raw batches.
-        # With gradient accumulation, one update happens every grad_accum_steps batches.
-        updates_per_epoch = max(1, len(train_loader) // config.grad_accum_steps)
+        # train_one_epoch also performs an update on the final batch even
+        # when ``len(train_loader) % grad_accum_steps != 0`` — so use ceil
+        # division here, otherwise the scheduler raises after the last
+        # partial-accumulation block of an epoch.
+        updates_per_epoch = max(
+            1, -(-len(train_loader) // config.grad_accum_steps)
+        )
         total_steps = config.max_epochs * updates_per_epoch
         scheduler = OneCycleLR(
             optimizer,
