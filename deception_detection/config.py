@@ -28,8 +28,8 @@ class ModelConfig:
     visual_backbone: str = "arcface"
     visual_backbone_model: str = "openai/clip-vit-base-patch32"  # only used when visual_backbone == "clip"
 
-    d_visual: int = 768
-    vit_n_layers: int = 4               # temporal Transformer depth
+    d_visual: int = 256
+    vit_n_layers: int = 2               # temporal Transformer depth
     vit_n_heads: int = 8                # multi-head attention heads
     cnn_chunk_size: int = 32            # frames per backbone forward (caps peak activation)
     in_channels: int = 1                # deliberately grayscale (real-life AR-glasses input)
@@ -42,15 +42,19 @@ class ModelConfig:
 
     # --- Cross-modal fusion ---
     d_cross: int = 128
-    d_fused: int = 256
+    d_fused: int = 128
     dropout: float = 0.6
 
     # --- UT-Adapters & multi-stage PAVF (DOLOS) ---
+    # NOTE: keep these invariants when tuning capacity:
+    #   * len(audio_fusion_layers) == len(visual_fusion_layers)
+    #   * max(visual_fusion_layers) <= vit_n_layers
+    #   * max(audio_fusion_layers)  <= number of W2V2 encoder layers (12 for base)
     use_ut_adapters: bool = True
-    ut_adapter_dim: int = 128                                  # bottleneck per UT spec
+    ut_adapter_dim: int = 32                                   # bottleneck per UT spec
     ut_conv_kernel: int = 3
-    audio_fusion_layers: tuple = (4, 8, 12)                    # 1-indexed Wav2Vec2 layers
-    visual_fusion_layers: tuple = (1, 2, 4)                    # 1-indexed temporal layers
+    audio_fusion_layers: tuple = (8, 12)                       # 1-indexed Wav2Vec2 layers
+    visual_fusion_layers: tuple = (1, 2)                       # 1-indexed temporal layers
     fusion_aggregator: str = "weighted_sum"                    # "sum" | "weighted_sum"
     freeze_visual_backbone: bool = True
     fusion_n_heads: int = 8
