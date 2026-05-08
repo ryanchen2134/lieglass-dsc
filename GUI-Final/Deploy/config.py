@@ -1,4 +1,10 @@
-from dataclasses import dataclass, field
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field, fields, asdict
+from pathlib import Path
+from typing import Any
+
 import torch
 
 
@@ -9,17 +15,26 @@ class ModelConfig:
     d_audio: int = 768
     wav2vec2_unfreeze_last_n: int = 0   # 0 = fully frozen; raise to fine-tune
 
-    # --- Visual encoder (CNN_Face + temporal Transformer) ---
-    # Note: ``vit_model`` is kept for backwards compatibility with serialized
-    # configs but is no longer loaded — the temporal encoder is a native
-    # ``nn.TransformerEncoder`` built from scratch (see visual_model.py).
-    vit_model: str = "google/vit-base-patch16-224"
+    # --- Visual encoder (pretrained backbone + temporal Transformer) ---
+    # The visual backbone is pretrained and frozen by default; only the
+    # projection layer, temporal Transformer (with UT-Adapters), fusion, and
+    # head receive gradients. The legacy from-scratch CNN_Face has been
+    # removed — this field selects the pretrained vision tower.
+    #
+    #   "clip"     -> Hugging Face CLIPVisionModel (default ``openai/clip-vit-base-patch32``).
+    #                 Hidden size: 768 for ViT-B/32, 1024 for ViT-L/14.
+    #   "arcface"  -> face-pretrained ResNet trunk (FaceNet/InceptionResnetV1
+    #                 from facenet-pytorch with VGGFace2 weights). 512-d output.
+    visual_backbone: str = "clip"
+    visual_backbone_model: str = "openai/clip-vit-base-patch32"
+
+    vit_model: str = "google/vit-base-patch16-224"   # retained for old configs; unused
     d_visual: int = 768
     vit_n_layers: int = 4               # temporal Transformer depth
     vit_n_heads: int = 8                # multi-head attention heads
-    vit_unfreeze_last_n: int = 4        # retained for compat; all temporal layers are trainable
-    cnn_chunk_size: int = 32            # frames per CNN chunk (caps peak activation)
-    in_channels: int = 1
+    vit_unfreeze_last_n: int = 0        # retained for compat; all temporal layers are trainable
+    cnn_chunk_size: int = 32            # frames per backbone forward (caps peak activation)
+    in_channels: int = 1                # deliberately grayscale (real-life AR-glasses input)
 
     # Full-frame pipeline — every frame of the clip is used. ``max_frames``
     # is a safety cap: if a clip has more frames than this, a contiguous
@@ -30,13 +45,24 @@ class ModelConfig:
     # --- Cross-modal fusion ---
     d_cross: int = 128
     d_fused: int = 256
-    dropout: float = 0.5
+    dropout: float = 0.6
+
+    # --- UT-Adapters & multi-stage PAVF (DOLOS) ---
+    use_ut_adapters: bool = True
+    ut_adapter_dim: int = 128                                  # bottleneck per UT spec
+    ut_conv_kernel: int = 3
+    audio_fusion_layers: tuple = (4, 8, 12)                    # 1-indexed Wav2Vec2 layers
+    visual_fusion_layers: tuple = (1, 2, 4)                    # 1-indexed temporal layers
+    fusion_aggregator: str = "weighted_sum"                    # "sum" | "weighted_sum"
+    freeze_visual_backbone: bool = False
+    fusion_n_heads: int = 8
+    fusion_dropout: float = 0.2
 
     # --- Training ---
     batch_size: int = 8                 # smaller default — clips are longer now
-    learning_rate: float = 2e-5
-    weight_decay: float = 0.15
-    max_epochs: int = 70
+    learning_rate: float = 4e-5
+    weight_decay: float = 0.20
+    max_epochs: int = 60
     patience: int = 8
     grad_clip: float = 1.0
     label_smoothing: float = 0.1
@@ -44,17 +70,63 @@ class ModelConfig:
     grad_accum_steps: int = 8           # effective_batch = batch_size × steps
 
     # --- Cross-validation ---
-    n_folds: int = 8
+    n_folds: int = 5
     seed: int = 1919
 
     # --- Paths ---
     feature_dir: str = "features"
-    manifest_csv: str = "Data/manifest_dolos.csv"
+    manifest_csv: str = "Data/mixed_manifest.csv"
     checkpoint_dir: str = "checkpoints"
 
     # --- DataLoader ---
-    num_workers: int = 2
-    prefetch_factor: int = 1
+    num_workers: int = 8
+    prefetch_factor: int = 8
 
     # --- Device ---
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- Resume ---
+    resume_from: str | None = None       # path to last.pt; None = fresh run
+
+    # ------------------------------------------------------------------
+    # Serialization helpers
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelConfig":
+        valid = {f.name for f in fields(cls)}
+        kwargs: dict[str, Any] = {}
+        for k, v in d.items():
+            if k not in valid:
+                continue
+            # Restore tuples for fusion-layer lists (JSON round-trip stores them as list).
+            if k in ("audio_fusion_layers", "visual_fusion_layers") and isinstance(v, list):
+                v = tuple(v)
+            kwargs[k] = v
+        return cls(**kwargs)
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "ModelConfig":
+        with open(path) as f:
+            return cls.from_dict(json.load(f))
+
+    def __post_init__(self):
+        if len(self.audio_fusion_layers) != len(self.visual_fusion_layers):
+            raise ValueError(
+                f"audio_fusion_layers ({self.audio_fusion_layers}) and "
+                f"visual_fusion_layers ({self.visual_fusion_layers}) must have equal length."
+            )
+        if max(self.visual_fusion_layers) > self.vit_n_layers:
+            raise ValueError(
+                f"max(visual_fusion_layers)={max(self.visual_fusion_layers)} "
+                f"exceeds vit_n_layers={self.vit_n_layers}."
+            )
+        if self.fusion_aggregator not in ("sum", "weighted_sum"):
+            raise ValueError(f"Unknown fusion_aggregator: {self.fusion_aggregator!r}")
+        if self.visual_backbone not in ("clip", "arcface"):
+            raise ValueError(
+                f"visual_backbone must be 'clip' or 'arcface'; got {self.visual_backbone!r}."
+            )
